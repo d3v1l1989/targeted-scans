@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
@@ -20,7 +21,7 @@ namespace JellyfinTargetedScan.Services;
 /// </summary>
 public class TargetedScanService
 {
-    private static readonly SemaphoreSlim _createLock = new(1, 1);
+    private static readonly ConcurrentDictionary<string, SemaphoreSlim> _parentLocks = new(StringComparer.OrdinalIgnoreCase);
 
     private readonly ILibraryManager _libraryManager;
     private readonly IProviderManager _providerManager;
@@ -43,11 +44,48 @@ public class TargetedScanService
     }
 
     /// <summary>
+    /// Walk up the directory tree to find the nearest known ancestor.
+    /// This is a read-only operation safe to call without holding any lock.
+    /// </summary>
+    private (List<string> MissingPaths, Folder? KnownAncestor) WalkUpToAncestor(string path, Dictionary<string, BaseItem?>? cache = null)
+    {
+        var missingPaths = new List<string> { path };
+        Folder? knownAncestor = null;
+        var current = Path.GetDirectoryName(path);
+
+        while (!string.IsNullOrEmpty(current))
+        {
+            BaseItem? found;
+            if (cache != null && cache.TryGetValue(current, out var cached))
+            {
+                found = cached;
+            }
+            else
+            {
+                found = _libraryManager.FindByPath(current, null);
+                cache?.TryAdd(current, found);
+            }
+
+            if (found is Folder folder)
+            {
+                knownAncestor = folder;
+                break;
+            }
+
+            missingPaths.Add(current);
+            current = Path.GetDirectoryName(current);
+        }
+
+        return (missingPaths, knownAncestor);
+    }
+
+    /// <summary>
     /// Scan a specific path, creating the item if new, or refreshing if existing.
     /// </summary>
     /// <param name="path">Filesystem path to scan.</param>
+    /// <param name="cache">Optional FindByPath cache shared across a batch.</param>
     /// <returns>The scanned or created item.</returns>
-    public async Task<ScanPathResult> ScanPathAsync(string path)
+    public async Task<ScanPathResult> ScanPathAsync(string path, Dictionary<string, BaseItem?>? cache = null)
     {
         _logger.LogInformation("TargetedScan: scanning path {Path}", path);
 
@@ -58,8 +96,18 @@ public class TargetedScanService
             return new ScanPathResult { Status = ScanStatus.PathNotFound };
         }
 
-        // 2. Check if item already exists in the database
-        var existing = _libraryManager.FindByPath(path, null);
+        // 2. Check if item already exists in the database (use cache if available)
+        BaseItem? existing;
+        if (cache != null && cache.TryGetValue(path, out var cachedItem))
+        {
+            existing = cachedItem;
+        }
+        else
+        {
+            existing = _libraryManager.FindByPath(path, null);
+            cache?.TryAdd(path, existing);
+        }
+
         if (existing != null)
         {
             _logger.LogInformation("TargetedScan: item already exists ({Id}), queuing refresh", existing.Id);
@@ -80,15 +128,26 @@ public class TargetedScanService
             };
         }
 
-        // 3. Acquire lock to prevent races when creating items
-        await _createLock.WaitAsync().ConfigureAwait(false);
+        // 3. Walk up BEFORE acquiring lock (read-only, safe without lock)
+        var (missingPaths, knownAncestor) = WalkUpToAncestor(path, cache);
+        if (knownAncestor == null)
+        {
+            _logger.LogError("TargetedScan: could not find any ancestor in database for path: {Path}", path);
+            return new ScanPathResult { Status = ScanStatus.ParentNotFound };
+        }
+
+        // 4. Acquire per-ancestor lock — different ancestors can proceed in parallel
+        var lockKey = knownAncestor.Path;
+        var parentLock = _parentLocks.GetOrAdd(lockKey, _ => new SemaphoreSlim(1, 1));
+        _logger.LogInformation("TargetedScan: acquiring lock for ancestor {LockKey}", lockKey);
+        await parentLock.WaitAsync().ConfigureAwait(false);
         try
         {
-            return CreateItems(path);
+            return CreateItems(path, missingPaths, knownAncestor, cache);
         }
         finally
         {
-            _createLock.Release();
+            parentLock.Release();
         }
     }
 
@@ -122,12 +181,13 @@ public class TargetedScanService
             "TargetedScan: batch scanning {Total} paths ({Reps} representatives, {Siblings} siblings auto-discovered)",
             unique.Count, representatives.Count, siblingPaths.Count);
 
+        var pathCache = new Dictionary<string, BaseItem?>(StringComparer.OrdinalIgnoreCase);
         var results = new List<ScanPathResult>();
 
         // Scan representatives
         foreach (var path in representatives)
         {
-            var result = await ScanPathAsync(path).ConfigureAwait(false);
+            var result = await ScanPathAsync(path, pathCache).ConfigureAwait(false);
             result.Path = path;
             results.Add(result);
         }
@@ -146,12 +206,15 @@ public class TargetedScanService
         return results;
     }
 
-    private ScanPathResult CreateItems(string path)
+    private ScanPathResult CreateItems(string path, List<string> missingPaths, Folder knownAncestor, Dictionary<string, BaseItem?>? cache = null)
     {
         // Re-check after acquiring lock — another request may have created it
         var existing = _libraryManager.FindByPath(path, null);
         if (existing != null)
         {
+            cache?.Remove(path);
+            cache?.TryAdd(path, existing);
+
             _logger.LogInformation("TargetedScan: item was created by concurrent request ({Id}), queuing refresh", existing.Id);
             _providerManager.QueueRefresh(
                 existing.Id,
@@ -168,30 +231,6 @@ public class TargetedScanService
                 ItemId = existing.Id.ToString("N"),
                 ItemName = existing.Name
             };
-        }
-
-        // Walk up the directory tree to find the nearest known ancestor
-        var missingPaths = new List<string> { path };
-        Folder? knownAncestor = null;
-        var current = Path.GetDirectoryName(path);
-
-        while (!string.IsNullOrEmpty(current))
-        {
-            var found = _libraryManager.FindByPath(current, null) as Folder;
-            if (found != null)
-            {
-                knownAncestor = found;
-                break;
-            }
-
-            missingPaths.Add(current);
-            current = Path.GetDirectoryName(current);
-        }
-
-        if (knownAncestor == null)
-        {
-            _logger.LogError("TargetedScan: could not find any ancestor in database for path: {Path}", path);
-            return new ScanPathResult { Status = ScanStatus.ParentNotFound };
         }
 
         _logger.LogInformation(
@@ -211,6 +250,9 @@ public class TargetedScanService
             var alreadyExists = _libraryManager.FindByPath(missingPath, null);
             if (alreadyExists != null)
             {
+                cache?.Remove(missingPath);
+                cache?.TryAdd(missingPath, alreadyExists);
+
                 _logger.LogInformation("TargetedScan: {Path} already exists (concurrent create), skipping", missingPath);
                 if (alreadyExists is Folder existingFolder)
                 {
@@ -240,6 +282,8 @@ public class TargetedScanService
 
             _libraryManager.CreateItem(newItem, currentParent);
             _logger.LogInformation("TargetedScan: created {ItemName} ({ItemId})", newItem.Name, newItem.Id);
+
+            cache?.TryAdd(missingPath, newItem);
 
             // Queue metadata refresh for every created item (Series, Season, Episode all need it)
             _providerManager.QueueRefresh(

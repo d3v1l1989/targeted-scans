@@ -11,6 +11,7 @@ use autopulse_database::{
 };
 use autopulse_utils::sha256checksum;
 use autopulse_utils::sify;
+use futures::future::join_all;
 use std::{path::PathBuf, sync::Arc};
 use tokio::sync::Mutex;
 use tracing::{debug, error, info, info_span, warn, Instrument};
@@ -45,35 +46,38 @@ impl<'a> PulseRunner<'a> {
             .filter(process_status.eq::<String>(ProcessStatus::Pending.into()))
             .load::<ScanEvent>(&mut get_conn(&self.manager.pool)?)?;
 
-        for ev in &mut evs {
-            let file_path = PathBuf::from(&ev.file_path);
+        {
+            let mut conn = get_conn(&self.manager.pool)?;
+            for ev in &mut evs {
+                let file_path = PathBuf::from(&ev.file_path);
 
-            if file_path.exists() {
-                if let Some(hash) = ev.file_hash.clone() {
-                    let file_hash = sha256checksum(&file_path)?;
+                if file_path.exists() {
+                    if let Some(hash) = ev.file_hash.clone() {
+                        let file_hash = sha256checksum(&file_path)?;
 
-                    if hash != file_hash {
-                        if ev.found_status != FoundStatus::HashMismatch.to_string() {
-                            mismatched_files.push((ev.file_path.clone(), ev.event_source.clone()));
+                        if hash != file_hash {
+                            if ev.found_status != FoundStatus::HashMismatch.to_string() {
+                                mismatched_files.push((ev.file_path.clone(), ev.event_source.clone()));
+                            }
+
+                            ev.found_status = FoundStatus::HashMismatch.into();
+                            ev.found_at = Some(chrono::Utc::now().naive_utc());
+                        } else {
+                            ev.found_status = FoundStatus::Found.into();
+                            found_files.push((ev.file_path.clone(), ev.event_source.clone()));
                         }
-
-                        ev.found_status = FoundStatus::HashMismatch.into();
-                        ev.found_at = Some(chrono::Utc::now().naive_utc());
                     } else {
+                        ev.found_at = Some(chrono::Utc::now().naive_utc());
+
                         ev.found_status = FoundStatus::Found.into();
+
                         found_files.push((ev.file_path.clone(), ev.event_source.clone()));
                     }
-                } else {
-                    ev.found_at = Some(chrono::Utc::now().naive_utc());
-
-                    ev.found_status = FoundStatus::Found.into();
-
-                    found_files.push((ev.file_path.clone(), ev.event_source.clone()));
                 }
-            }
 
-            ev.updated_at = chrono::Utc::now().naive_utc();
-            get_conn(&self.manager.pool)?.save_changes(ev)?;
+                ev.updated_at = chrono::Utc::now().naive_utc();
+                conn.save_changes(ev)?;
+            }
         }
 
         if !found_files.is_empty() {
@@ -216,31 +220,37 @@ impl<'a> PulseRunner<'a> {
 
         let trigger_settings = &self.manager.settings.triggers;
 
-        for (name, target) in &self.manager.settings.targets {
-            let evs = evs
-                .iter_mut()
+        // Build per-target event ID lists and cloned events for parallel processing
+        let target_data: Vec<_> = self.manager.settings.targets.iter().map(|(name, target)| {
+            let ev_refs: Vec<&ScanEvent> = evs
+                .iter()
                 .filter(|x| !x.get_targets_hit().contains(name))
                 .filter(|x| {
                     trigger_settings
                         .get(&x.event_source)
                         .is_none_or(|trigger| !trigger.excludes().contains(name))
                 })
-                .collect::<Vec<&mut ScanEvent>>();
+                .collect();
+            let ev_ids: Vec<String> = ev_refs.iter().map(|x| x.id.clone()).collect();
+            let ev_clones: Vec<ScanEvent> = ev_refs.iter().map(|x| (*x).clone()).collect();
+            (name.clone(), target, ev_ids, ev_clones)
+        }).collect();
 
-            let res = target
-                .process(
-                    // TODO: Somehow clean this up
-                    evs.iter()
-                        .map(|x| &**x)
-                        .collect::<Vec<&ScanEvent>>()
-                        .as_slice(),
-                )
-                .instrument(info_span!("process ", target = name))
-                .await;
+        // Fire all targets concurrently
+        let results = join_all(target_data.iter().map(|(name, target, _, ev_clones)| {
+            let ev_refs: Vec<&ScanEvent> = ev_clones.iter().collect();
+            async move {
+                target.process(&ev_refs)
+                    .instrument(info_span!("process ", target = name.as_str()))
+                    .await
+            }
+        })).await;
 
+        // Merge results back into the mutable evs slice
+        for ((name, _, ev_ids, _), res) in target_data.iter().zip(results) {
             match res {
                 Ok(s) => {
-                    for ev in evs {
+                    for ev in evs.iter_mut().filter(|x| ev_ids.contains(&x.id)) {
                         if s.contains(&ev.id) {
                             ev.add_target_hit(name);
                         } else {
@@ -249,8 +259,7 @@ impl<'a> PulseRunner<'a> {
                     }
                 }
                 Err(e) => {
-                    failed_ids.extend(evs.iter().map(|x| x.id.clone()));
-
+                    failed_ids.extend(ev_ids.iter().cloned());
                     error!("failed to process target '{}': {:?}", name, e);
                 }
             }
@@ -260,10 +269,10 @@ impl<'a> PulseRunner<'a> {
         let mut retrying = vec![];
         let mut failed = vec![];
 
+        let mut conn = get_conn(&self.manager.pool)?;
+
         for ev in evs.iter_mut() {
             ev.updated_at = chrono::Utc::now().naive_utc();
-
-            let mut conn = get_conn(&self.manager.pool)?;
 
             if failed_ids.contains(&ev.id) {
                 ev.failed_times += 1;

@@ -412,9 +412,7 @@ impl TargetProcess for Plex {
             let matched_libraries = self.get_libraries(&libraries, &ev_path);
 
             if matched_libraries.is_empty() {
-                error!("no matching library for {ev_path}");
-
-                *succeeded_entry = false;
+                debug!("no matching Plex library for {ev_path}, skipping (not a failure)");
 
                 continue;
             }

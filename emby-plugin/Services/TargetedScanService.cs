@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
@@ -13,7 +14,7 @@ namespace EmbyTargetedScan.Services
 {
     public class TargetedScanService
     {
-        private static readonly SemaphoreSlim _createLock = new SemaphoreSlim(1, 1);
+        private static readonly ConcurrentDictionary<string, SemaphoreSlim> _parentLocks = new ConcurrentDictionary<string, SemaphoreSlim>(StringComparer.OrdinalIgnoreCase);
 
         private readonly ILibraryManager _libraryManager;
         private readonly IProviderManager _providerManager;
@@ -32,7 +33,46 @@ namespace EmbyTargetedScan.Services
             _logger = logger;
         }
 
-        public ScanPathResult ScanPath(string path)
+        /// <summary>
+        /// Walk up the directory tree to find the nearest known ancestor.
+        /// This is a read-only operation safe to call without holding any lock.
+        /// </summary>
+        private (List<string> MissingPaths, Folder KnownAncestor) WalkUpToAncestor(string path, Dictionary<string, BaseItem> cache = null)
+        {
+            var missingPaths = new List<string> { path };
+            Folder knownAncestor = null;
+            var current = Path.GetDirectoryName(path);
+
+            while (!string.IsNullOrEmpty(current))
+            {
+                BaseItem found;
+                if (cache != null && cache.TryGetValue(current, out var cached))
+                {
+                    found = cached;
+                }
+                else
+                {
+                    found = _libraryManager.FindByPath(current, null);
+                    if (cache != null && found != null)
+                    {
+                        cache[current] = found;
+                    }
+                }
+
+                if (found is Folder folder)
+                {
+                    knownAncestor = folder;
+                    break;
+                }
+
+                missingPaths.Add(current);
+                current = Path.GetDirectoryName(current);
+            }
+
+            return (missingPaths, knownAncestor);
+        }
+
+        public ScanPathResult ScanPath(string path, Dictionary<string, BaseItem> cache = null)
         {
             _logger.Info("TargetedScan: scanning path {0}", path);
 
@@ -43,8 +83,21 @@ namespace EmbyTargetedScan.Services
                 return new ScanPathResult { Status = ScanStatus.PathNotFound };
             }
 
-            // 2. Check if item already exists in the database
-            var existing = _libraryManager.FindByPath(path, null);
+            // 2. Check if item already exists in the database (use cache if available)
+            BaseItem existing;
+            if (cache != null && cache.TryGetValue(path, out var cachedItem))
+            {
+                existing = cachedItem;
+            }
+            else
+            {
+                existing = _libraryManager.FindByPath(path, null);
+                if (cache != null && existing != null)
+                {
+                    cache[path] = existing;
+                }
+            }
+
             if (existing != null)
             {
                 _logger.Info("TargetedScan: item already exists ({0}), queuing refresh", existing.InternalId);
@@ -65,15 +118,26 @@ namespace EmbyTargetedScan.Services
                 };
             }
 
-            // 3. Acquire lock to prevent races when creating items
-            _createLock.Wait();
+            // 3. Walk up BEFORE acquiring lock (read-only, safe without lock)
+            var (missingPaths, knownAncestor) = WalkUpToAncestor(path, cache);
+            if (knownAncestor == null)
+            {
+                _logger.Error("TargetedScan: could not find any ancestor in database for path: {0}", path);
+                return new ScanPathResult { Status = ScanStatus.ParentNotFound };
+            }
+
+            // 4. Acquire per-ancestor lock — different ancestors can proceed in parallel
+            var lockKey = knownAncestor.Path;
+            var parentLock = _parentLocks.GetOrAdd(lockKey, _ => new SemaphoreSlim(1, 1));
+            _logger.Info("TargetedScan: acquiring lock for ancestor {0}", lockKey);
+            parentLock.Wait();
             try
             {
-                return CreateItems(path);
+                return CreateItems(path, missingPaths, knownAncestor, cache);
             }
             finally
             {
-                _createLock.Release();
+                parentLock.Release();
             }
         }
 
@@ -93,10 +157,11 @@ namespace EmbyTargetedScan.Services
 
             _logger.Info("TargetedScan: batch scanning {0} paths", sorted.Count);
 
+            var pathCache = new Dictionary<string, BaseItem>(StringComparer.OrdinalIgnoreCase);
             var results = new List<ScanPathResult>();
             foreach (var path in sorted)
             {
-                var result = ScanPath(path);
+                var result = ScanPath(path, pathCache);
                 result.Path = path;
                 results.Add(result);
             }
@@ -104,12 +169,17 @@ namespace EmbyTargetedScan.Services
             return results;
         }
 
-        private ScanPathResult CreateItems(string path)
+        private ScanPathResult CreateItems(string path, List<string> missingPaths, Folder knownAncestor, Dictionary<string, BaseItem> cache = null)
         {
             // Re-check after acquiring lock — another request may have created it
             var existing = _libraryManager.FindByPath(path, null);
             if (existing != null)
             {
+                if (cache != null)
+                {
+                    cache[path] = existing;
+                }
+
                 _logger.Info("TargetedScan: item was created by concurrent request ({0}), queuing refresh", existing.InternalId);
                 _providerManager.QueueRefresh(
                     existing.InternalId,
@@ -126,30 +196,6 @@ namespace EmbyTargetedScan.Services
                     ItemId = existing.InternalId.ToString(),
                     ItemName = existing.Name
                 };
-            }
-
-            // Walk up the directory tree to find the nearest known ancestor
-            var missingPaths = new List<string> { path };
-            Folder knownAncestor = null;
-            var current = Path.GetDirectoryName(path);
-
-            while (!string.IsNullOrEmpty(current))
-            {
-                var found = _libraryManager.FindByPath(current, null) as Folder;
-                if (found != null)
-                {
-                    knownAncestor = found;
-                    break;
-                }
-
-                missingPaths.Add(current);
-                current = Path.GetDirectoryName(current);
-            }
-
-            if (knownAncestor == null)
-            {
-                _logger.Error("TargetedScan: could not find any ancestor in database for path: {0}", path);
-                return new ScanPathResult { Status = ScanStatus.ParentNotFound };
             }
 
             _logger.Info(
@@ -169,6 +215,11 @@ namespace EmbyTargetedScan.Services
                 var alreadyExists = _libraryManager.FindByPath(missingPath, null);
                 if (alreadyExists != null)
                 {
+                    if (cache != null)
+                    {
+                        cache[missingPath] = alreadyExists;
+                    }
+
                     _logger.Info("TargetedScan: {0} already exists (concurrent create), skipping", missingPath);
                     if (alreadyExists is Folder existingFolder)
                     {
@@ -198,6 +249,11 @@ namespace EmbyTargetedScan.Services
 
                 _libraryManager.CreateItem(newItem, currentParent);
                 _logger.Info("TargetedScan: created {0} ({1})", newItem.Name, newItem.InternalId);
+
+                if (cache != null)
+                {
+                    cache[missingPath] = newItem;
+                }
 
                 // Queue metadata refresh for every created item
                 _providerManager.QueueRefresh(

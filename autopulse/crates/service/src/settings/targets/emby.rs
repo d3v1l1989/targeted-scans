@@ -4,6 +4,7 @@ use crate::settings::targets::TargetProcess;
 use anyhow::Context;
 use autopulse_database::models::ScanEvent;
 use autopulse_utils::get_url;
+use futures::future::join_all;
 use reqwest::header;
 use serde::{Deserialize, Serialize};
 use std::{collections::HashMap, fmt::Display, io::Cursor, path::Path};
@@ -413,7 +414,8 @@ impl TargetProcess for Emby {
             let ev_path = ev.get_path(&self.rewrite);
             let matched_libraries = self.get_libraries(&libraries, &ev_path);
             if matched_libraries.is_empty() {
-                error!("failed to find library for file: {}", ev_path);
+                debug!("no matching library for {}, skipping (not a failure)", ev_path);
+                succeeded.insert(ev.id.clone(), true);
                 continue;
             }
             all_with_paths.push((*ev, ev_path));
@@ -430,9 +432,13 @@ impl TargetProcess for Emby {
         match self.targeted_scan_batch(batch_paths).await {
             Ok(batch_result) => {
                 remaining = Vec::new();
+                let result_map: HashMap<&str, &ScanPathResponse> = batch_result.results
+                    .iter()
+                    .map(|r| (r.message.as_str(), r))
+                    .collect();
+
                 for (ev, ev_path) in &all_with_paths {
-                    let matched = batch_result.results.iter().find(|r| r.message == *ev_path);
-                    match matched {
+                    match result_map.get(ev_path.as_str()) {
                         Some(r) if r.status == "Created" || r.status == "Refreshed" || r.status == "Discovered" => {
                             info!(
                                 "targeted scan succeeded for {}: {} ({})",
@@ -468,13 +474,22 @@ impl TargetProcess for Emby {
                 tokio::time::sleep(std::time::Duration::from_secs(delay)).await;
             }
 
+            let scan_futures: Vec<_> = remaining.iter().map(|(ev, ev_path)| {
+                let path = ev_path.clone();
+                async move {
+                    let result = self.targeted_scan(&path).await;
+                    (*ev, path, result)
+                }
+            }).collect();
+            let results = join_all(scan_futures).await;
+
             let mut still_remaining = Vec::new();
-            for (ev, ev_path) in &remaining {
-                match self.targeted_scan(ev_path).await {
-                    Ok(result) => {
+            for (ev, ev_path, result) in results {
+                match result {
+                    Ok(scan_result) => {
                         info!(
                             "targeted scan succeeded for {}: {} ({})",
-                            ev_path, result.item_id, result.status
+                            ev_path, scan_result.item_id, scan_result.status
                         );
                         *succeeded.entry(ev.id.clone()).or_insert(true) &= true;
                     }
@@ -483,7 +498,7 @@ impl TargetProcess for Emby {
                             "targeted scan failed for {}: {}, will retry",
                             ev_path, e
                         );
-                        still_remaining.push((*ev, ev_path.clone()));
+                        still_remaining.push((ev, ev_path));
                     }
                 }
             }
