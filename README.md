@@ -68,113 +68,118 @@ Sonarr/Radarr → (webhook) → Autopulse → (ScanPath API) → Jellyfin/Emby P
    ```
 3. Restart Emby
 
-#### Verify the plugin is working
-
-After restarting, test with curl:
-
-```bash
-# Jellyfin
-curl -X POST http://localhost:8096/Library/ScanPath \
-  -H "Content-Type: application/json" \
-  -H 'Authorization: MediaBrowser Token="YOUR_API_KEY"' \
-  -d '{"Path": "/media/TV/Some Show/Season 1/S01E01.mkv"}'
-
-# Emby
-curl -X POST http://localhost:8096/Library/ScanPath \
-  -H "Content-Type: application/json" \
-  -H 'X-Emby-Token: YOUR_API_KEY' \
-  -d '{"Path": "/media/TV/Some Show/Season 1/S01E01.mkv"}'
-```
-
-You should get a JSON response with a `Status` of `Created`, `Refreshed`, or `PathNotFound`.
-
 ---
 
 ### Step 2: Deploy Autopulse
 
 The Autopulse fork receives webhooks from Sonarr/Radarr and calls the `ScanPath` endpoint on your media server. A pre-built Docker image is available on Docker Hub.
 
-#### Create your config
+#### `docker-compose.yml`
 
-```bash
-mkdir -p data
-cp config.example.yaml data/config.yaml
+```yaml
+services:
+  autopulse:
+    restart: unless-stopped
+    container_name: autopulse
+    image: d3v1l1989/autopulse-targeted:latest
+    hostname: autopulse
+    healthcheck:
+      test: ["CMD-SHELL", "wget --quiet --tries=1 -O /dev/null http://127.0.0.1:2875/stats || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+    environment:
+      - PUID=1000
+      - PGID=1000
+      - TZ=Etc/UTC
+      - AUTOPULSE__APP__DATABASE_URL=sqlite://data/autopulse.db
+    volumes:
+      - ./data:/app                # config.yaml goes here
+      - /mnt:/mnt                  # mount your media paths (must match Sonarr/Radarr paths)
+      - /etc/localtime:/etc/localtime:ro
+    ports:
+      - "2875:2875"
+
+  autopulse-ui:
+    restart: unless-stopped
+    container_name: autopulse-ui
+    image: danonline/autopulse:ui
+    hostname: autopulse-ui
+    environment:
+      - PUID=1000
+      - PGID=1000
+      - TZ=Etc/UTC
+      - FORCE_SERVER_URL=true
+      - DEFAULT_SERVER_URL=http://autopulse:2875
+      - ORIGIN=http://localhost:2880       # change to your domain if using reverse proxy
+    ports:
+      - "2880:2880"
 ```
 
-Edit `data/config.yaml` — here's what each section does:
+#### `data/config.yaml`
 
 ```yaml
 app:
-  log_level: debug                              # debug | info | warn | error
-  database_url: sqlite:///app/autopulse.db      # event tracking database
+  log_level: debug
+  database_url: sqlite:///app/autopulse.db
 
 auth:
-  username: your_username                       # HTTP Basic Auth for webhook endpoints
-  password: your_password                       # Sonarr/Radarr will use these credentials
+  username: your_username
+  password: your_password
 
 opts:
-  check_path: true            # verify file exists on disk before processing
-  max_retries: 5              # retry failed scans with exponential backoff
-  default_timer_wait: 10      # seconds to wait after webhook before processing
-                              # (gives the file time to finish writing)
+  check_path: true
+  max_retries: 5
+  default_timer_wait: 10
 
-# --- TRIGGERS ---
-# Each trigger is a webhook endpoint: POST http://autopulse:2875/triggers/<name>
-# The <name> must match a key below.
 triggers:
-  sonarr:                     # → http://autopulse:2875/triggers/sonarr
+  sonarr:
     type: sonarr
     rewrite:
-      from: /mnt/media        # path as Sonarr sees it
-      to: /mnt/media          # path as Jellyfin/Emby sees it (change if they differ)
-  radarr:                     # → http://autopulse:2875/triggers/radarr
+      from: /mnt/media
+      to: /mnt/media
+  radarr:
     type: radarr
     rewrite:
       from: /mnt/media
       to: /mnt/media
+  lidarr:
+    type: lidarr
+    rewrite:
+      from: /mnt/media
+      to: /mnt/media
 
-# --- TARGETS ---
-# Where to send scan requests. Uses a three-tier strategy:
-#   1. ScanPath plugin endpoint (instant)
-#   2. Individual retries with exponential backoff
-#   3. Library enumeration fallback (slow, if plugin unavailable)
 targets:
-  jellyfin:
-    type: jellyfin
-    url: http://jellyfin:8096
-    token: YOUR_JELLYFIN_API_KEY      # Dashboard > API Keys
-    refresh_metadata: true            # enable fallback if plugin unavailable
+  plex:
+    type: plex
+    url: http://plex:32400
+    token: YOUR_PLEX_TOKEN
+    refresh: true
   emby:
     type: emby
     url: http://emby:8096
-    token: YOUR_EMBY_API_KEY          # API Key from Emby settings
+    token: YOUR_EMBY_API_KEY
+    refresh_metadata: true
+  jellyfin:
+    type: jellyfin
+    url: http://jellyfin:8096
+    token: YOUR_JELLYFIN_API_KEY
     refresh_metadata: true
 ```
 
 > **Path rewriting:** If Sonarr sees files at `/downloads/tv/...` but Jellyfin sees them at `/media/tv/...`, set `from: /downloads/tv` and `to: /media/tv`. If they share the same mount paths, set both to the same value.
 
-See [`autopulse/config.example.yaml`](autopulse/config.example.yaml) for the full template.
-
-#### Start the containers
+Each trigger becomes a webhook endpoint at `http://autopulse:2875/triggers/<name>` — you'll use these URLs in the next step.
 
 ```bash
-cp docker-compose.example.yml docker-compose.yml
+mkdir -p data
+# create your config.yaml in data/
 docker compose up -d
 ```
 
 This starts two containers:
 - **autopulse** on port `2875` — the API that receives webhooks and triggers scans
 - **autopulse-ui** on port `2880` — a web dashboard to monitor scan events
-
-See [`autopulse/docker-compose.example.yml`](autopulse/docker-compose.example.yml) for the full Docker Compose template. Make sure the volumes mount your media paths so `check_path` can verify files exist.
-
-Verify it's running:
-
-```bash
-curl http://localhost:2875/stats
-```
-
-The UI is available at `http://localhost:2880`.
 
 ---
 
@@ -192,11 +197,10 @@ This connects your *arr apps to Autopulse. When Sonarr/Radarr downloads or renam
    - **Username:** your autopulse `auth.username`
    - **Password:** your autopulse `auth.password`
 3. Select events:
-   - **On Download** (import)
-   - **On Upgrade**
+   - **On Download**
+   - **On Episode File Delete**
+   - **On Series Delete**
    - **On Rename**
-   - **On Series Delete** (optional)
-   - **On Episode File Delete** (optional)
 4. Click **Test** then **Save**
 
 #### Radarr
@@ -209,11 +213,10 @@ This connects your *arr apps to Autopulse. When Sonarr/Radarr downloads or renam
    - **Username:** your autopulse `auth.username`
    - **Password:** your autopulse `auth.password`
 3. Select events:
-   - **On Download** (import)
-   - **On Upgrade**
+   - **On Download**
+   - **On Movie File Delete**
+   - **On Movie Delete**
    - **On Rename**
-   - **On Movie Delete** (optional)
-   - **On Movie File Delete** (optional)
 4. Click **Test** then **Save**
 
 #### Multiple Instances
