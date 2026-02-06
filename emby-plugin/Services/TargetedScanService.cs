@@ -180,15 +180,17 @@ namespace EmbyTargetedScan.Services
                     cache[path] = existing;
                 }
 
-                _logger.Info("TargetedScan: item was created by concurrent request ({0}), queuing refresh", existing.InternalId);
-                _providerManager.QueueRefresh(
-                    existing.InternalId,
+                _logger.Info("TargetedScan: item was created by concurrent request ({0}), refreshing via ValidateChildren", existing.InternalId);
+                var parentFolder = existing.GetParent() as Folder ?? knownAncestor;
+                parentFolder.ValidateChildren(
+                    new Progress<double>(),
+                    CancellationToken.None,
                     new MetadataRefreshOptions(new DirectoryService(_logger, _fileSystem))
                     {
                         MetadataRefreshMode = MetadataRefreshMode.FullRefresh,
                         ReplaceAllMetadata = false
                     },
-                    RefreshPriority.High);
+                    recursive: false).GetAwaiter().GetResult();
 
                 return new ScanPathResult
                 {
@@ -255,17 +257,6 @@ namespace EmbyTargetedScan.Services
                     cache[missingPath] = newItem;
                 }
 
-                // Queue metadata refresh for every created item
-                _providerManager.QueueRefresh(
-                    newItem.InternalId,
-                    new MetadataRefreshOptions(directoryService)
-                    {
-                        MetadataRefreshMode = MetadataRefreshMode.FullRefresh,
-                        ReplaceAllMetadata = true
-                    },
-                    RefreshPriority.High);
-                _logger.Info("TargetedScan: metadata refresh queued for {0}", newItem.Name);
-
                 lastCreated = newItem;
 
                 if (newItem is Folder folder)
@@ -283,6 +274,21 @@ namespace EmbyTargetedScan.Services
             {
                 return new ScanPathResult { Status = ScanStatus.Failed };
             }
+
+            // ValidateChildren on the ancestor to properly register items in parent cache
+            // and trigger metadata refresh. This replaces QueueRefresh which doesn't work
+            // for items created via CreateItem (the refresh queue ignores them).
+            _logger.Info("TargetedScan: running ValidateChildren on {0}", knownAncestor.Name);
+            knownAncestor.ValidateChildren(
+                new Progress<double>(),
+                CancellationToken.None,
+                new MetadataRefreshOptions(directoryService)
+                {
+                    MetadataRefreshMode = MetadataRefreshMode.FullRefresh,
+                    ReplaceAllMetadata = true
+                },
+                recursive: true).GetAwaiter().GetResult();
+            _logger.Info("TargetedScan: ValidateChildren completed on {0}", knownAncestor.Name);
 
             return new ScanPathResult
             {

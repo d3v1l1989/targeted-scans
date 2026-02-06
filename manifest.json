@@ -9,6 +9,14 @@
     "imageUrl": "https://raw.githubusercontent.com/d3v1l1989/targeted-scans/main/jellyfin-plugin/thumb.png",
     "versions": [
       {
+        "version": "1.2.0.0",
+        "changelog": "Fix item visibility: replace QueueRefresh with ValidateChildren for proper parent-child registration and metadata refresh",
+        "targetAbi": "10.11.0.0",
+        "sourceUrl": "https://github.com/d3v1l1989/targeted-scans/releases/download/v1.2.0/jellyfin-targeted-scan-v1.2.0.zip",
+        "checksum": "496158b0b138a712b6d28c8a9d001e7e",
+        "timestamp": "2026-02-06T00:00:00Z"
+      },
+      {
         "version": "1.1.0.0",
         "changelog": "Per-parent locking for parallel creates, FindByPath cache across batches, extract walk-up before lock",
         "targetAbi": "10.11.0.0",

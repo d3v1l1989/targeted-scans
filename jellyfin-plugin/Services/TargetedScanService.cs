@@ -143,7 +143,7 @@ public class TargetedScanService
         await parentLock.WaitAsync().ConfigureAwait(false);
         try
         {
-            return CreateItems(path, missingPaths, knownAncestor, cache);
+            return await CreateItemsAsync(path, missingPaths, knownAncestor, cache).ConfigureAwait(false);
         }
         finally
         {
@@ -206,7 +206,7 @@ public class TargetedScanService
         return results;
     }
 
-    private ScanPathResult CreateItems(string path, List<string> missingPaths, Folder knownAncestor, Dictionary<string, BaseItem?>? cache = null)
+    private async Task<ScanPathResult> CreateItemsAsync(string path, List<string> missingPaths, Folder knownAncestor, Dictionary<string, BaseItem?>? cache = null)
     {
         // Re-check after acquiring lock — another request may have created it
         var existing = _libraryManager.FindByPath(path, null);
@@ -215,15 +215,18 @@ public class TargetedScanService
             cache?.Remove(path);
             cache?.TryAdd(path, existing);
 
-            _logger.LogInformation("TargetedScan: item was created by concurrent request ({Id}), queuing refresh", existing.Id);
-            _providerManager.QueueRefresh(
-                existing.Id,
+            _logger.LogInformation("TargetedScan: item was created by concurrent request ({Id}), refreshing via ValidateChildren", existing.Id);
+            var parentFolder = existing.GetParent() as Folder ?? knownAncestor;
+            await parentFolder.ValidateChildren(
+                new Progress<double>(),
                 new MetadataRefreshOptions(new DirectoryService(_fileSystem))
                 {
                     MetadataRefreshMode = MetadataRefreshMode.FullRefresh,
                     ReplaceAllMetadata = false
                 },
-                RefreshPriority.High);
+                recursive: false,
+                allowRemoveRoot: false,
+                CancellationToken.None).ConfigureAwait(false);
 
             return new ScanPathResult
             {
@@ -284,18 +287,6 @@ public class TargetedScanService
             _logger.LogInformation("TargetedScan: created {ItemName} ({ItemId})", newItem.Name, newItem.Id);
 
             cache?.TryAdd(missingPath, newItem);
-
-            // Queue metadata refresh for every created item (Series, Season, Episode all need it)
-            _providerManager.QueueRefresh(
-                newItem.Id,
-                new MetadataRefreshOptions(directoryService)
-                {
-                    MetadataRefreshMode = MetadataRefreshMode.FullRefresh,
-                    ReplaceAllMetadata = true
-                },
-                RefreshPriority.High);
-            _logger.LogInformation("TargetedScan: metadata refresh queued for {ItemName}", newItem.Name);
-
             lastCreated = newItem;
 
             if (newItem is Folder folder)
@@ -313,6 +304,22 @@ public class TargetedScanService
         {
             return new ScanPathResult { Status = ScanStatus.Failed };
         }
+
+        // ValidateChildren on the ancestor to properly register items in parent cache
+        // and trigger metadata refresh. This replaces QueueRefresh which doesn't work
+        // for items created via CreateItem (the refresh queue ignores them).
+        _logger.LogInformation("TargetedScan: running ValidateChildren on {AncestorName}", knownAncestor.Name);
+        await knownAncestor.ValidateChildren(
+            new Progress<double>(),
+            new MetadataRefreshOptions(directoryService)
+            {
+                MetadataRefreshMode = MetadataRefreshMode.FullRefresh,
+                ReplaceAllMetadata = true
+            },
+            recursive: true,
+            allowRemoveRoot: false,
+            CancellationToken.None).ConfigureAwait(false);
+        _logger.LogInformation("TargetedScan: ValidateChildren completed on {AncestorName}", knownAncestor.Name);
 
         return new ScanPathResult
         {
