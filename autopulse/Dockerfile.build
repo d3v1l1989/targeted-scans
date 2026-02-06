@@ -1,0 +1,10 @@
+FROM clux/muslrust:stable AS builder
+WORKDIR /src
+COPY . .
+RUN cargo build --release --target x86_64-unknown-linux-musl --no-default-features --features sqlite
+
+FROM ghcr.io/linuxserver/baseimage-alpine:3.23 AS runtime
+WORKDIR /app
+COPY --from=builder /src/target/x86_64-unknown-linux-musl/release/autopulse /bin
+HEALTHCHECK --interval=10s --timeout=5s --start-period=5s --retries=3 CMD wget --quiet --tries=1 --spider http://127.0.0.1:${AUTOPULSE__APP__PORT:-2875}/stats || exit 1
+CMD ["/usr/bin/with-contenv", "/bin/autopulse"]

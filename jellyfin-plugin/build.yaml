@@ -1,0 +1,11 @@
+name: "TargetedScan"
+guid: "a1b2c3d4-e5f6-7890-abcd-ef1234567890"
+version: "1.0.0.0"
+targetAbi: "10.11.0.0"
+framework: "net9.0"
+owner: "custom"
+overview: "Adds POST /Library/ScanPath endpoint for targeted library scanning"
+description: "Allows external tools to trigger a targeted library scan for a specific path without scanning the entire library."
+category: "General"
+artifacts:
+  - "JellyfinTargetedScan.dll"

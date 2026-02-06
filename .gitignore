@@ -1,0 +1,19 @@
+# .NET build output
+bin/
+obj/
+
+# Emby SDK DLLs (can't redistribute)
+emby-plugin/sdk/
+
+# Rust build output
+autopulse/target/
+
+# IDE
+.vs/
+.vscode/
+*.user
+*.suo
+
+# OS
+.DS_Store
+Thumbs.db

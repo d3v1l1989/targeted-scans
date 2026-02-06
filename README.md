@@ -1,0 +1,341 @@
+<p align="center">
+  <img src="jellyfin-plugin/thumb.png" alt="Targeted Scans" width="200"/>
+</p>
+
+<h1 align="center">Targeted Scans</h1>
+
+<p align="center">
+  Jellyfin & Emby plugins for instant, targeted library scanning — no full library scans needed.<br/>
+  Includes a modified <a href="https://github.com/dan-online/autopulse">Autopulse</a> fork that connects Sonarr/Radarr to the plugins automatically.
+</p>
+
+---
+
+## The Problem
+
+When new media arrives on disk, Jellyfin and Emby require a full library scan to discover it. On large libraries (1000+ shows), this can take **minutes to hours**.
+
+## The Solution
+
+**Targeted Scans** adds a `POST /Library/ScanPath` API endpoint to Jellyfin and Emby that instantly creates the new item in the database and queues a metadata refresh — **under a second** regardless of library size.
+
+The included **Autopulse fork** bridges Sonarr/Radarr to the plugin automatically:
+
+```
+Sonarr/Radarr → (webhook) → Autopulse → (ScanPath API) → Jellyfin/Emby Plugin → Item Created
+```
+
+### How the plugin works
+
+1. Receives a filesystem path (e.g. `/media/TV/Breaking Bad/Season 1/S01E01.mkv`)
+2. Walks up the directory tree to find the nearest known ancestor in the library database
+3. Creates all intermediate items (Series, Season, Episode) from the top down
+4. Queues metadata refresh for each created item
+5. Returns the item ID and status
+
+---
+
+## Full Setup Guide
+
+### Step 1: Install the Plugin
+
+#### Jellyfin (10.11+)
+
+**Option A: Plugin Repository (Recommended)**
+
+1. Go to **Dashboard** > **Plugins** > **Repositories**
+2. Add a new repository:
+   - **Name:** `Targeted Scans`
+   - **URL:** `https://raw.githubusercontent.com/d3v1l1989/targeted-scans/main/manifest.json`
+3. Go to **Catalog** and search for **TargetedScan**
+4. Install and restart Jellyfin
+
+**Option B: Manual Install**
+
+1. Download `jellyfin-targeted-scan-v1.0.0.zip` from [Releases](https://github.com/d3v1l1989/targeted-scans/releases)
+2. Extract to your Jellyfin plugins directory:
+   ```
+   {JellyfinDataPath}/plugins/TargetedScan/
+   ```
+3. Restart Jellyfin
+
+#### Emby
+
+1. Download `EmbyTargetedScan.dll` from [Releases](https://github.com/d3v1l1989/targeted-scans/releases)
+2. Copy to your Emby plugins directory:
+   ```
+   {EmbyConfigPath}/plugins/
+   ```
+3. Restart Emby
+
+#### Verify the plugin is working
+
+After restarting, test with curl:
+
+```bash
+# Jellyfin
+curl -X POST http://localhost:8096/Library/ScanPath \
+  -H "Content-Type: application/json" \
+  -H 'Authorization: MediaBrowser Token="YOUR_API_KEY"' \
+  -d '{"Path": "/media/TV/Some Show/Season 1/S01E01.mkv"}'
+
+# Emby
+curl -X POST http://localhost:8096/Library/ScanPath \
+  -H "Content-Type: application/json" \
+  -H 'X-Emby-Token: YOUR_API_KEY' \
+  -d '{"Path": "/media/TV/Some Show/Season 1/S01E01.mkv"}'
+```
+
+You should get a JSON response with a `Status` of `Created`, `Refreshed`, or `PathNotFound`.
+
+---
+
+### Step 2: Deploy Autopulse
+
+The Autopulse fork receives webhooks from Sonarr/Radarr and calls the `ScanPath` endpoint on your media server. A pre-built Docker image is available on Docker Hub.
+
+#### Create your config
+
+```bash
+mkdir -p data
+cp config.example.yaml data/config.yaml
+```
+
+Edit `data/config.yaml` — here's what each section does:
+
+```yaml
+app:
+  log_level: debug                              # debug | info | warn | error
+  database_url: sqlite:///app/autopulse.db      # event tracking database
+
+auth:
+  username: your_username                       # HTTP Basic Auth for webhook endpoints
+  password: your_password                       # Sonarr/Radarr will use these credentials
+
+opts:
+  check_path: true            # verify file exists on disk before processing
+  max_retries: 5              # retry failed scans with exponential backoff
+  default_timer_wait: 10      # seconds to wait after webhook before processing
+                              # (gives the file time to finish writing)
+
+# --- TRIGGERS ---
+# Each trigger is a webhook endpoint: POST http://autopulse:2875/triggers/<name>
+# The <name> must match a key below.
+triggers:
+  sonarr:                     # → http://autopulse:2875/triggers/sonarr
+    type: sonarr
+    rewrite:
+      from: /mnt/media        # path as Sonarr sees it
+      to: /mnt/media          # path as Jellyfin/Emby sees it (change if they differ)
+  radarr:                     # → http://autopulse:2875/triggers/radarr
+    type: radarr
+    rewrite:
+      from: /mnt/media
+      to: /mnt/media
+
+# --- TARGETS ---
+# Where to send scan requests. Uses a three-tier strategy:
+#   1. ScanPath plugin endpoint (instant)
+#   2. Individual retries with exponential backoff
+#   3. Library enumeration fallback (slow, if plugin unavailable)
+targets:
+  jellyfin:
+    type: jellyfin
+    url: http://jellyfin:8096
+    token: YOUR_JELLYFIN_API_KEY      # Dashboard > API Keys
+    refresh_metadata: true            # enable fallback if plugin unavailable
+  emby:
+    type: emby
+    url: http://emby:8096
+    token: YOUR_EMBY_API_KEY          # API Key from Emby settings
+    refresh_metadata: true
+```
+
+> **Path rewriting:** If Sonarr sees files at `/downloads/tv/...` but Jellyfin sees them at `/media/tv/...`, set `from: /downloads/tv` and `to: /media/tv`. If they share the same mount paths, set both to the same value.
+
+See [`autopulse/config.example.yaml`](autopulse/config.example.yaml) for the full template.
+
+#### Start the containers
+
+```bash
+cp docker-compose.example.yml docker-compose.yml
+docker compose up -d
+```
+
+This starts two containers:
+- **autopulse** on port `2875` — the API that receives webhooks and triggers scans
+- **autopulse-ui** on port `2880` — a web dashboard to monitor scan events
+
+See [`autopulse/docker-compose.example.yml`](autopulse/docker-compose.example.yml) for the full Docker Compose template. Make sure the volumes mount your media paths so `check_path` can verify files exist.
+
+Verify it's running:
+
+```bash
+curl http://localhost:2875/stats
+```
+
+The UI is available at `http://localhost:2880`.
+
+---
+
+### Step 3: Configure Sonarr/Radarr Webhooks
+
+This connects your *arr apps to Autopulse. When Sonarr/Radarr downloads or renames media, it sends a webhook to Autopulse, which triggers the plugin.
+
+#### Sonarr
+
+1. Go to **Settings** > **Connect** > **+** > **Webhook**
+2. Fill in:
+   - **Name:** `Autopulse`
+   - **URL:** `http://autopulse:2875/triggers/sonarr`
+   - **Method:** `POST`
+   - **Username:** your autopulse `auth.username`
+   - **Password:** your autopulse `auth.password`
+3. Select events:
+   - **On Download** (import)
+   - **On Upgrade**
+   - **On Rename**
+   - **On Series Delete** (optional)
+   - **On Episode File Delete** (optional)
+4. Click **Test** then **Save**
+
+#### Radarr
+
+1. Go to **Settings** > **Connect** > **+** > **Webhook**
+2. Fill in:
+   - **Name:** `Autopulse`
+   - **URL:** `http://autopulse:2875/triggers/radarr`
+   - **Method:** `POST`
+   - **Username:** your autopulse `auth.username`
+   - **Password:** your autopulse `auth.password`
+3. Select events:
+   - **On Download** (import)
+   - **On Upgrade**
+   - **On Rename**
+   - **On Movie Delete** (optional)
+   - **On Movie File Delete** (optional)
+4. Click **Test** then **Save**
+
+#### Multiple Instances
+
+If you run multiple Sonarr/Radarr instances (e.g. for different languages or qualities), create a separate trigger for each:
+
+```yaml
+triggers:
+  sonarr:
+    type: sonarr
+    rewrite:
+      from: /mnt/media
+      to: /mnt/media
+  sonarranime:
+    type: sonarr
+    rewrite:
+      from: /mnt/media
+      to: /mnt/media
+  radarr:
+    type: radarr
+    rewrite:
+      from: /mnt/media
+      to: /mnt/media
+  radarranime:
+    type: radarr
+    rewrite:
+      from: /mnt/media
+      to: /mnt/media
+```
+
+Then point each instance's webhook URL to its matching trigger name (e.g. `http://autopulse:2875/triggers/sonarranime`).
+
+---
+
+### Step 4: Verify the Full Pipeline
+
+1. **Grab something in Sonarr** — trigger a manual search for an episode
+2. **Watch Autopulse logs:**
+   ```bash
+   docker logs -f autopulse
+   ```
+3. You should see:
+   - Webhook received from Sonarr
+   - Path extracted and rewritten
+   - `ScanPath` called on Jellyfin/Emby
+   - Item created or refreshed
+4. **Check Jellyfin/Emby** — the episode should appear immediately with metadata
+
+---
+
+## API Reference
+
+Both plugins expose identical endpoints. You only need these if you're calling the plugin directly (Autopulse handles this automatically).
+
+### `POST /Library/ScanPath`
+
+Scan a single path.
+
+**Headers:**
+```
+Content-Type: application/json
+Authorization: MediaBrowser Token="YOUR_API_KEY"
+```
+
+**Request:**
+```json
+{
+  "Path": "/media/TV/Breaking Bad/Season 1/S01E01.mkv"
+}
+```
+
+**Response:**
+```json
+{
+  "ItemId": "abc123...",
+  "ItemName": "S01E01",
+  "Status": "Created",
+  "Message": "Item created and metadata refresh queued"
+}
+```
+
+### `POST /Library/ScanPaths`
+
+Scan multiple paths in a single batch.
+
+**Request:**
+```json
+{
+  "Paths": [
+    "/media/TV/Breaking Bad/Season 1/S01E01.mkv",
+    "/media/TV/Breaking Bad/Season 1/S01E02.mkv"
+  ]
+}
+```
+
+**Response:**
+```json
+{
+  "Results": [
+    {
+      "ItemId": "abc123...",
+      "ItemName": "S01E01",
+      "Status": "Created",
+      "Message": "/media/TV/Breaking Bad/Season 1/S01E01.mkv"
+    }
+  ]
+}
+```
+
+### Status Values
+
+| Status | Description |
+|--------|-------------|
+| `Created` | New item created and metadata refresh queued |
+| `Refreshed` | Item already existed, metadata refresh queued |
+| `PathNotFound` | Path does not exist on the filesystem |
+| `ParentNotFound` | Could not find a parent library item for the path |
+| `Failed` | Scan failed |
+| `Discovered` | (Batch only) Sibling will be auto-discovered by parent's metadata refresh |
+
+---
+
+## License
+
+Jellyfin and Emby plugins are provided as-is. The autopulse fork is licensed under the same terms as the [original project](https://github.com/dan-online/autopulse).

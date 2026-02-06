@@ -1,0 +1,69 @@
+name: Continuous Integration
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+
+jobs:
+  ui:
+    name: UI Build and Check
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ./ui
+    steps:
+    - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
+
+    - uses: rrbutani/use-nix-shell-action@v1
+      with:
+        devShell: ./ui#default
+
+    - name: Install
+      run: yarn install --immutable
+
+    - name: Biome Check
+      run: yarn biome ci
+
+    - name: Typecheck
+      run: yarn check
+
+    - name: Build
+      run: yarn build
+
+  server:
+    name: Server Build and Check
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Project
+        uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
+
+      - uses: rrbutani/use-nix-shell-action@v1
+
+      - name: Cargo Cache
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          restore-keys: |
+            ${{ runner.os }}-cargo-release-x86_64-unknown-linux-musl-
+          key: ${{ runner.os }}-cargo-release-x86_64-unknown-linux-musl-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Build
+        run: cargo build --release
+
+      - name: Format Check
+        run: cargo fmt -- --check
+
+      - name: Clippy Check
+        run: cargo clippy --release --workspace -- -D warnings
+
+      - name: Test
+        run: cargo nextest run --release --workspace

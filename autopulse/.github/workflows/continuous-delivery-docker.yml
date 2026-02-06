@@ -1,0 +1,422 @@
+name: Continuous Delivery / Docker
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+  release:
+    types: [published]
+
+concurrency:
+  group: continuous-delivery-docker-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref == 'refs/heads/main' }}
+
+permissions:
+  contents: read
+  packages: write
+  id-token: write
+
+jobs:
+  push_readme:
+    name: Push README to Docker Hub
+    runs-on: ubuntu-latest
+    if: github.event_name != 'pull_request'
+    steps:
+      - uses: actions/checkout@v6
+      - name: Push README to Docker Hub
+        uses: christian-korneck/update-container-description-action@v1
+        env:
+          DOCKER_USER: ${{ secrets.DOCKERHUB_USERNAME }}
+          DOCKER_PASS: ${{ secrets.DOCKERHUB_TOKEN }}
+        with:
+          destination_container_repo: danonline/autopulse
+          provider: dockerhub
+          short_description: '💫 bridge your media server'
+          readme_file: 'README.md'
+  
+  build_ui:
+    name: Build UI
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      # - name: Set up QEMU
+      #   uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to the GHCR
+        uses: docker/login-action@3227f5311cb93ffd14d13e65d8cc400d30f4dd8a
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@3227f5311cb93ffd14d13e65d8cc400d30f4dd8a
+        with:
+          registry: docker.io
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Extract metadata (labels)
+        id: meta
+        uses: docker/metadata-action@a60f0f62b5c12316066c8db464bfb2faafd7907b
+        with:
+          images: ghcr.io/dan-online/autopulse,danonline/autopulse
+          # flavor: |
+          #   latest=false
+          #   prefix=ui-,onlatest=true
+          # tags: |
+          #   type=ref,event=pr,prefix=ui-pr-
+
+      - name: Identify tag
+        run: |
+          if [ -n "${{ github.event.number }}" ]; then
+            echo "PR number: ${{ github.event.number }}"
+            echo "tag=ui-pr-${{ github.event.number }}" >> "$GITHUB_OUTPUT"
+            echo "tag_dynamic=ui-dynamic-pr-${{ github.event.number }}" >> "$GITHUB_OUTPUT"
+          elif [ -n "${{ github.event.release.tag_name }}" ]; then
+            echo "Release tag: ${{ github.event.release.tag_name }}"
+            echo "tag=ui-${{ github.event.release.tag_name }}" >> "$GITHUB_OUTPUT"
+            echo "tag_dynamic=ui-dynamic-${{ github.event.release.tag_name }}" >> "$GITHUB_OUTPUT"
+            echo "tag_stable=stable" >> "$GITHUB_OUTPUT"
+          else
+            echo "Not a PR branch"
+            echo "tag=ui" >> "$GITHUB_OUTPUT"
+            echo "tag_dynamic=ui-dynamic" >> "$GITHUB_OUTPUT"
+          fi
+        id: tag
+
+      - name: Build and push (ui)
+        uses: docker/build-push-action@v6
+        with:
+          push: true
+          tags: |
+            ghcr.io/dan-online/autopulse:${{ steps.tag.outputs.tag }}
+            danonline/autopulse:${{ steps.tag.outputs.tag }}
+          labels: ${{ steps.meta.outputs.labels }}
+          context: ui/
+          # cache-from: type=gha
+          # cache-to: type=gha,mode=max
+          platforms: linux/amd64,linux/arm64
+
+      - name: Build and push (ui) (dynamic)
+        uses: docker/build-push-action@v6
+        with:
+          push: true
+          tags: |
+            ghcr.io/dan-online/autopulse:${{ steps.tag.outputs.tag_dynamic }}
+            danonline/autopulse:${{ steps.tag.outputs.tag_dynamic }}
+          labels: ${{ steps.meta.outputs.labels }}
+          context: ui/
+          file: ui/Dockerfile.build
+          # cache-from: type=gha
+          # cache-to: type=gha,mode=max
+          platforms: linux/amd64,linux/arm64
+
+      # - name: Login to Docker Hub
+      #   uses: docker/login-action@v3
+      #   with:
+      #     username: ${{ secrets.DOCKERHUB_USERNAME }}
+      #     password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      # - name: Push Docker Image
+      #   run: |
+      #     docker tag ${{ steps.meta.outputs.tags }} danonline/autopulse-ui:${{ steps.meta.outputs.tags }}
+      #     docker push danonline/autopulse-ui:${{ steps.meta.outputs.tags }}
+
+  build:
+    name: Build - ${{ matrix.platform.name }} - ${{ matrix.feature }}
+    strategy:
+      matrix:
+        feature:
+          - full
+          - postgres
+          - sqlite
+        platform:
+          - name: linux/amd64
+            runner: ubuntu-22.04
+            target: x86_64-unknown-linux-musl
+            tag: -amd64
+          - name: linux/arm64
+            runner: ubuntu-22.04-arm
+            target: aarch64-unknown-linux-musl
+            tag: -arm64
+            build_args: |
+              IMAGE_TAG=arm64v8-3.20
+    runs-on: ${{ matrix.platform.runner }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      # - name: Set up QEMU
+      #   uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to the GHCR
+        uses: docker/login-action@3227f5311cb93ffd14d13e65d8cc400d30f4dd8a
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@3227f5311cb93ffd14d13e65d8cc400d30f4dd8a
+        with:
+          registry: docker.io
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Extract metadata (labels)
+        id: meta
+        uses: docker/metadata-action@a60f0f62b5c12316066c8db464bfb2faafd7907b
+        with:
+          images: ghcr.io/dan-online/autopulse,danonline/autopulse
+
+      - name: Cargo Cache
+        if: matrix.feature == 'full'
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ runner.os }}-cargo-release-${{ matrix.platform.target }}-${{ matrix.feature }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-release-${{ matrix.platform.target }}-full-
+
+      - name: Cargo Cache
+        if: matrix.feature != 'full'
+        uses: actions/cache/restore@v5
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ runner.os }}-cargo-release-${{ matrix.platform.target }}-${{ matrix.feature }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-release-${{ matrix.platform.target }}-full-
+
+      - name: Pull Request suffix
+        run: |
+          if [ -n "${{ github.event.number }}" ]; then
+            echo "PR number: ${{ github.event.number }}"
+            echo "tag=pr-${{ github.event.number }}" >> "$GITHUB_OUTPUT"
+          elif [ -n "${{ github.event.release.tag_name }}" ]; then
+            echo "Release tag: ${{ github.event.release.tag_name }}"
+            echo "tag=${{ github.event.release.tag_name }}" >> "$GITHUB_OUTPUT"
+            echo "tag_stable=stable" >> "$GITHUB_OUTPUT"
+          else
+            echo "Not a PR branch"
+            echo "tag=latest" >> "$GITHUB_OUTPUT"
+          fi
+        id: tag
+
+      - uses: taiki-e/github-actions/install-rust@main
+        with:
+          toolchain: stable
+          component: rustfmt,clippy
+          target: ${{ matrix.platform.target }}
+
+      - uses: taiki-e/setup-cross-toolchain-action@main
+        with:
+          target: ${{ matrix.platform.target }}
+
+      - name: Test binary
+        if: matrix.feature == 'full'
+        run: cargo test --locked --release --features vendored --target ${{ matrix.platform.target }} --workspace
+
+      - name: Build binary
+        if: matrix.feature == 'full'
+        run: cargo build --locked --release --features vendored --target ${{ matrix.platform.target }}
+
+      # - name: Test binary
+      #   if: matrix.feature != 'full'
+      #   run: cargo test --locked --release --no-default-features --features vendored,${{ matrix.feature }} --target ${{ matrix.platform.target }} --workspace
+
+      - name: Build binary
+        if: matrix.feature != 'full'
+        run: cargo build --locked --release --no-default-features --features vendored,${{ matrix.feature }} --target ${{ matrix.platform.target }}
+
+      - name: Copy binary
+        run: |
+          cp target/${{ matrix.platform.target }}/release/autopulse ./autopulse
+
+          file ./autopulse
+
+      # "latest-platform?" tag, full feature-set
+      - name: Create Docker Image
+        uses: docker/build-push-action@v6
+        if: matrix.feature == 'full'
+        with:
+          push: true
+          context: .
+          tags: |
+            ghcr.io/dan-online/autopulse:${{ steps.tag.outputs.tag }}${{ matrix.platform.tag }}
+            danonline/autopulse:${{ steps.tag.outputs.tag }}${{ matrix.platform.tag }}
+            ${{ steps.tag.outputs.tag_stable && format('ghcr.io/dan-online/autopulse:{0}{1}', steps.tag.outputs.tag_stable, matrix.platform.tag) || '' }}
+            ${{ steps.tag.outputs.tag_stable && format('danonline/autopulse:{0}{1}', steps.tag.outputs.tag_stable, matrix.platform.tag) || '' }}
+          labels: ${{ steps.meta.outputs.labels }}
+          platforms: ${{ matrix.platform.name }}
+          build-args: ${{ matrix.platform.build_args }}
+
+      # "feature-platform?" tag, selected feature-set
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        if: matrix.feature != 'full'
+        with:
+          push: true
+          context: .
+          tags: |
+            ghcr.io/dan-online/autopulse:${{ steps.tag.outputs.tag }}-${{ matrix.feature }}${{ matrix.platform.tag }}
+            danonline/autopulse:${{ steps.tag.outputs.tag }}-${{ matrix.feature }}${{ matrix.platform.tag }}
+            ${{ steps.tag.outputs.tag_stable && format('ghcr.io/dan-online/autopulse:{0}-{1}{2}', steps.tag.outputs.tag_stable, matrix.feature, matrix.platform.tag) || '' }}
+            ${{ steps.tag.outputs.tag_stable && format('danonline/autopulse:{0}-{1}{2}', steps.tag.outputs.tag_stable, matrix.feature, matrix.platform.tag) || '' }}
+          labels: ${{ steps.meta.outputs.labels }}
+          platforms: ${{ matrix.platform.name }}
+          build-args: ${{ matrix.platform.build_args }}
+
+      
+      
+  manifest:
+    name: Push manifest
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - uses: actions/checkout@v6
+      
+      - name: Pull Request suffix
+        run: |
+          if [ -n "${{ github.event.number }}" ]; then
+            echo "PR number: ${{ github.event.number }}"
+            echo "tag=pr-${{ github.event.number }}" >> "$GITHUB_OUTPUT"
+          elif [ -n "${{ github.event.release.tag_name }}" ]; then
+            echo "Release tag: ${{ github.event.release.tag_name }}"
+            echo "tag=${{ github.event.release.tag_name }}" >> "$GITHUB_OUTPUT"
+            echo "tag_stable=stable" >> "$GITHUB_OUTPUT"
+          else
+            echo "Not a PR branch"
+            echo "tag=latest" >> "$GITHUB_OUTPUT"
+          fi
+        id: tag
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to the GHCR
+        uses: docker/login-action@3227f5311cb93ffd14d13e65d8cc400d30f4dd8a
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@3227f5311cb93ffd14d13e65d8cc400d30f4dd8a
+        with:
+          registry: docker.io
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Create and push manifests
+        run: |
+          GHCR_BASE="ghcr.io/dan-online/autopulse"
+          DOCKERHUB_BASE="danonline/autopulse"
+          TAG="${{ steps.tag.outputs.tag }}"
+          TAG_STABLE="${{ steps.tag.outputs.tag_stable }}"
+          
+          # First, create and push all manifests to GHCR
+          # Get digests from GHCR only
+          AMD64_DIGEST=$(docker manifest inspect ${GHCR_BASE}:${TAG}-amd64 | jq -r '.manifests[0].digest')
+          ARM64_DIGEST=$(docker manifest inspect ${GHCR_BASE}:${TAG}-arm64 | jq -r '.manifests[0].digest')
+
+          POSTGRES_AMD64_DIGEST=$(docker manifest inspect ${GHCR_BASE}:${TAG}-postgres-amd64 | jq -r '.manifests[0].digest')
+          POSTGRES_ARM64_DIGEST=$(docker manifest inspect ${GHCR_BASE}:${TAG}-postgres-arm64 | jq -r '.manifests[0].digest')
+
+          SQLITE_AMD64_DIGEST=$(docker manifest inspect ${GHCR_BASE}:${TAG}-sqlite-amd64 | jq -r '.manifests[0].digest')
+          SQLITE_ARM64_DIGEST=$(docker manifest inspect ${GHCR_BASE}:${TAG}-sqlite-arm64 | jq -r '.manifests[0].digest')
+
+          # Build manifests on GHCR
+          echo "Creating manifests on GHCR..."
+          
+          # Main manifest
+          docker manifest create ${GHCR_BASE}:${TAG} \
+              --amend ${GHCR_BASE}@${AMD64_DIGEST} \
+              --amend ${GHCR_BASE}@${ARM64_DIGEST}
+          
+          # Postgres manifest
+          docker manifest create ${GHCR_BASE}:${TAG}-postgres \
+              --amend ${GHCR_BASE}@${POSTGRES_AMD64_DIGEST} \
+              --amend ${GHCR_BASE}@${POSTGRES_ARM64_DIGEST}
+          
+          # SQLite manifest
+          docker manifest create ${GHCR_BASE}:${TAG}-sqlite \
+              --amend ${GHCR_BASE}@${SQLITE_AMD64_DIGEST} \
+              --amend ${GHCR_BASE}@${SQLITE_ARM64_DIGEST}
+
+          docker manifest push ${GHCR_BASE}:${TAG}-postgres
+          docker manifest push ${GHCR_BASE}:${TAG}-sqlite
+          docker manifest push ${GHCR_BASE}:${TAG}
+
+          docker buildx imagetools create \
+            --tag danonline/autopulse:${TAG} \
+            ghcr.io/dan-online/autopulse:${TAG}
+
+          docker buildx imagetools create \
+            --tag danonline/autopulse:${TAG}-postgres \
+            ghcr.io/dan-online/autopulse:${TAG}-postgres
+
+          docker buildx imagetools create \
+            --tag danonline/autopulse:${TAG}-sqlite \
+            ghcr.io/dan-online/autopulse:${TAG}-sqlite
+          
+          if [ -n "$TAG_STABLE" ]; then
+            echo "Creating stable manifests..."
+            docker manifest create ${GHCR_BASE}:${TAG_STABLE} \
+                --amend ${GHCR_BASE}@${AMD64_DIGEST} \
+                --amend ${GHCR_BASE}@${ARM64_DIGEST}
+            docker manifest create ${GHCR_BASE}:${TAG_STABLE}-postgres \
+                --amend ${GHCR_BASE}@${POSTGRES_AMD64_DIGEST} \
+                --amend ${GHCR_BASE}@${POSTGRES_ARM64_DIGEST}
+            docker manifest create ${GHCR_BASE}:${TAG_STABLE}-sqlite \
+                --amend ${GHCR_BASE}@${SQLITE_AMD64_DIGEST} \
+                --amend ${GHCR_BASE}@${SQLITE_ARM64_DIGEST}
+
+            docker manifest push ${GHCR_BASE}:${TAG_STABLE}-postgres
+            docker manifest push ${GHCR_BASE}:${TAG_STABLE}-sqlite
+            docker manifest push ${GHCR_BASE}:${TAG_STABLE}
+
+            docker buildx imagetools create \
+              --tag danonline/autopulse:${TAG_STABLE} \
+              ghcr.io/dan-online/autopulse:${TAG_STABLE}
+
+            docker buildx imagetools create \
+              --tag danonline/autopulse:${TAG_STABLE}-postgres \
+              ghcr.io/dan-online/autopulse:${TAG_STABLE}-postgres
+
+            docker buildx imagetools create \
+              --tag danonline/autopulse:${TAG_STABLE}-sqlite \
+              ghcr.io/dan-online/autopulse:${TAG_STABLE}-sqlite
+          fi
+          
+          echo "Copy images over to Docker Hub..."
+          # docker pull ${GHCR_BASE}:${TAG} -q
+          # docker pull ${GHCR_BASE}:${TAG}-postgres -q
+          # docker pull ${GHCR_BASE}:${TAG}-sqlite -q
+
+          # docker tag ${GHCR_BASE}:${TAG} ${DOCKERHUB_BASE}:${TAG}
+          # docker tag ${GHCR_BASE}:${TAG}-postgres ${DOCKERHUB_BASE}:${TAG}-postgres
+          # docker tag ${GHCR_BASE}:${TAG}-sqlite ${DOCKERHUB_BASE}:${TAG}-sqlite
+          
+          # docker push ${DOCKERHUB_BASE}:${TAG}-postgres -q
+          # docker push ${DOCKERHUB_BASE}:${TAG}-sqlite -q
+          # docker push ${DOCKERHUB_BASE}:${TAG} -q

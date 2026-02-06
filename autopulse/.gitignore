@@ -1,0 +1,25 @@
+# direnv
+.envrc
+.direnv
+
+# Testing
+/config.*
+!config.example.yaml
+autopulse.log
+data
+/target
+docker-compose.yml
+!docker-compose.example.yml
+
+# Debugging
+.vscode/launch.json
+
+# Random testing scripts
+*.sh
+
+# Nix
+result
+
+# md files
+*.md
+!README.md

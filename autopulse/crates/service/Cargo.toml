@@ -1,0 +1,41 @@
+[package]
+name = "autopulse-service"
+edition = "2021"
+
+version.workspace = true
+
+[features]
+vendored = ["reqwest/native-tls-vendored"]
+
+[dependencies]
+# Crates
+autopulse-database = { workspace = true }
+autopulse-utils = { workspace = true }
+
+# Core
+anyhow = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+chrono = { workspace = true }
+tokio = { workspace = true, features = ["macros", "process"] }
+futures = { workspace = true }
+
+# HTTP client
+reqwest = { version = "0.13.0", features = ["json", "stream"] }
+
+# Credential encoding
+base64 = "0.22.1"
+
+# Config
+config = "0.15.6"
+
+# File system notifications
+notify = "8.0.0"
+
+# Other
+struson = { version = "0.6.0", features = [
+    "simple-api",
+    "serde",
+] } # Parse Jellyfin response as a stream
+async-recursion = "1.1.1" # Retry requests for webhooks

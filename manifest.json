@@ -1,0 +1,21 @@
+[
+  {
+    "guid": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+    "name": "TargetedScan",
+    "overview": "Adds POST /Library/ScanPath endpoint for targeted library scanning without full library scans",
+    "description": "Allows external tools like Autopulse, Sonarr, or Radarr to trigger a targeted library scan for a specific filesystem path. Creates new items (Series, Season, Episode) instantly using ResolvePath + CreateItem, then queues metadata refresh. No full library scan needed.",
+    "owner": "d3v1l1989",
+    "category": "General",
+    "imageUrl": "https://raw.githubusercontent.com/d3v1l1989/targeted-scans/main/jellyfin-plugin/thumb.png",
+    "versions": [
+      {
+        "version": "1.0.0.0",
+        "changelog": "Initial release",
+        "targetAbi": "10.11.0.0",
+        "sourceUrl": "https://github.com/d3v1l1989/targeted-scans/releases/download/v1.0.0/jellyfin-targeted-scan-v1.0.0.zip",
+        "checksum": "15cba1b938420ca1fddff09444713851",
+        "timestamp": "2025-02-06T00:00:00Z"
+      }
+    ]
+  }
+]

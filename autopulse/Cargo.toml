@@ -1,0 +1,72 @@
+[package]
+name = "autopulse"
+edition = "2021"
+
+version.workspace = true
+
+[workspace.package]
+version = "1.5.0"
+
+[features]
+vendored = ["autopulse-service/vendored", "autopulse-database/vendored"]
+sqlite = ["autopulse-database/sqlite"]
+postgres = ["autopulse-database/postgres"]
+default = ["sqlite", "postgres"]
+
+[dependencies]
+# Crates
+autopulse-server = { workspace = true }
+autopulse-database = { workspace = true }
+autopulse-service = { workspace = true }
+autopulse-utils = { workspace = true }
+
+# Core
+anyhow = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread"] }
+tracing = { workspace = true }
+
+# CLI
+clap = { version = "4.5.29", default-features = false, features = [
+    "std",
+    "derive",
+    "help",
+] }
+
+[workspace]
+members = ["crates/*"]
+
+[workspace.dependencies]
+# Crates
+autopulse-server = { path = "crates/server" }
+autopulse-database = { path = "crates/database" }
+autopulse-service = { path = "crates/service" }
+autopulse-utils = { path = "crates/utils" }
+
+# Error handling
+anyhow = { version = "1.0.95" }
+
+# Serialization
+serde = { version = "1.0.218", features = ["derive"] }
+serde_json = "1.0.139"
+
+# Tracing
+tracing = "0.1.41"
+
+# Date and time
+chrono = { version = "0.4.38", features = ["serde"] }
+
+# Asynchronous runtime
+tokio = { version = "1.43.0" }
+# tokio-util = { version = "0.7.17" }
+futures = { version = "0.3.31" }
+
+# URL parsing
+url = "2.5.4"
+
+# [dev-dependencies]
+# # Standardize logging output
+# tracing-test = "0.2.5"
+
+# [profile.dev]
+# opt-level = 1
+# incremental = true

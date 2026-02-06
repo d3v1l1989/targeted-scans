@@ -1,0 +1,46 @@
+app:
+  log_level: debug
+  database_url: sqlite:///app/autopulse.db
+
+auth:
+  username: your_username
+  password: your_password
+
+opts:
+  check_path: true
+  max_retries: 5
+  default_timer_wait: 10
+
+triggers:
+  sonarr:
+    type: sonarr
+    rewrite:
+      from: /mnt/media
+      to: /mnt/media
+  radarr:
+    type: radarr
+    rewrite:
+      from: /mnt/media
+      to: /mnt/media
+  lidarr:
+    type: lidarr
+    rewrite:
+      from: /mnt/media
+      to: /mnt/media
+
+targets:
+  plex:
+    type: plex
+    url: http://plex:32400
+    token: YOUR_PLEX_TOKEN
+    refresh: true
+  emby:
+    type: emby
+    url: http://emby:8096
+    token: YOUR_EMBY_API_KEY
+    refresh_metadata: true
+  jellyfin:
+    type: jellyfin
+    url: http://jellyfin:8096
+    token: YOUR_JELLYFIN_API_KEY
+    refresh_metadata: true
