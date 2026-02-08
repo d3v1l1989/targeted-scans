@@ -13,7 +13,7 @@
         "changelog": "Remove ValidateChildren entirely, process all paths through CreateItem individually for reliable metadata resolution",
         "targetAbi": "10.11.0.0",
         "sourceUrl": "https://github.com/d3v1l1989/targeted-scans/releases/download/v1.7.0/jellyfin-targeted-scan-v1.7.0.zip",
-        "checksum": "1600ff9747cff858de46df12869faaa2",
+        "checksum": "c5ccbf6c3a7784a98c4e52099224ba7f",
         "timestamp": "2026-02-08T00:00:00Z"
       },
       {
