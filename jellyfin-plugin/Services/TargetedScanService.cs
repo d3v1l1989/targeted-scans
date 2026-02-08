@@ -22,6 +22,7 @@ namespace JellyfinTargetedScan.Services;
 public class TargetedScanService
 {
     private static readonly ConcurrentDictionary<string, SemaphoreSlim> _parentLocks = new(StringComparer.OrdinalIgnoreCase);
+    private static readonly ConcurrentDictionary<string, SemaphoreSlim> _validateLocks = new(StringComparer.OrdinalIgnoreCase);
 
     private readonly ILibraryManager _libraryManager;
     private readonly IProviderManager _providerManager;
@@ -148,6 +149,10 @@ public class TargetedScanService
         finally
         {
             parentLock.Release();
+            if (parentLock.CurrentCount == 1 && _parentLocks.Count > 50)
+            {
+                _parentLocks.TryRemove(lockKey, out _);
+            }
         }
     }
 
@@ -206,7 +211,7 @@ public class TargetedScanService
         return results;
     }
 
-    private async Task<ScanPathResult> CreateItemsAsync(string path, List<string> missingPaths, Folder knownAncestor, Dictionary<string, BaseItem?>? cache = null)
+    private Task<ScanPathResult> CreateItemsAsync(string path, List<string> missingPaths, Folder knownAncestor, Dictionary<string, BaseItem?>? cache = null)
     {
         // Re-check after acquiring lock — another request may have created it
         var existing = _libraryManager.FindByPath(path, null);
@@ -219,6 +224,8 @@ public class TargetedScanService
             var parentFolder = existing.GetParent() as Folder ?? knownAncestor;
             _ = Task.Run(async () =>
             {
+                var vLock = _validateLocks.GetOrAdd(parentFolder.Path, _ => new SemaphoreSlim(1, 1));
+                await vLock.WaitAsync().ConfigureAwait(false);
                 try
                 {
                     await parentFolder.ValidateChildren(
@@ -237,14 +244,22 @@ public class TargetedScanService
                 {
                     _logger.LogError(ex, "TargetedScan: background ValidateChildren failed on {ParentName}", parentFolder.Name);
                 }
+                finally
+                {
+                    vLock.Release();
+                    if (vLock.CurrentCount == 1 && _validateLocks.Count > 50)
+                    {
+                        _validateLocks.TryRemove(parentFolder.Path, out _);
+                    }
+                }
             });
 
-            return new ScanPathResult
+            return Task.FromResult(new ScanPathResult
             {
                 Status = ScanStatus.Refreshed,
                 ItemId = existing.Id.ToString("N"),
                 ItemName = existing.Name
-            };
+            });
         }
 
         _logger.LogInformation(
@@ -287,7 +302,7 @@ public class TargetedScanService
             if (newItem == null)
             {
                 _logger.LogWarning("TargetedScan: ResolvePath returned null for: {Path}", missingPath);
-                return new ScanPathResult { Status = ScanStatus.Failed };
+                return Task.FromResult(new ScanPathResult { Status = ScanStatus.Failed });
             }
 
             _logger.LogInformation(
@@ -313,7 +328,7 @@ public class TargetedScanService
 
         if (lastCreated == null)
         {
-            return new ScanPathResult { Status = ScanStatus.Failed };
+            return Task.FromResult(new ScanPathResult { Status = ScanStatus.Failed });
         }
 
         // Fire-and-forget ValidateChildren on the ancestor to properly register items
@@ -322,6 +337,8 @@ public class TargetedScanService
         _logger.LogInformation("TargetedScan: scheduling ValidateChildren on {AncestorName} in background", knownAncestor.Name);
         _ = Task.Run(async () =>
         {
+            var vLock = _validateLocks.GetOrAdd(knownAncestor.Path, _ => new SemaphoreSlim(1, 1));
+            await vLock.WaitAsync().ConfigureAwait(false);
             try
             {
                 await knownAncestor.ValidateChildren(
@@ -340,14 +357,22 @@ public class TargetedScanService
             {
                 _logger.LogError(ex, "TargetedScan: background ValidateChildren failed on {AncestorName}", knownAncestor.Name);
             }
+            finally
+            {
+                vLock.Release();
+                if (vLock.CurrentCount == 1 && _validateLocks.Count > 50)
+                {
+                    _validateLocks.TryRemove(knownAncestor.Path, out _);
+                }
+            }
         });
 
-        return new ScanPathResult
+        return Task.FromResult(new ScanPathResult
         {
             Status = ScanStatus.Created,
             ItemId = lastCreated.Id.ToString("N"),
             ItemName = lastCreated.Name
-        };
+        });
     }
 }
 

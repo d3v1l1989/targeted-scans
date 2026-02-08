@@ -111,6 +111,8 @@ struct ScanPathResponse {
     #[serde(default)]
     item_name: String,
     status: String,
+    #[serde(default)]
+    path: String,
     #[allow(dead_code)]
     #[serde(default)]
     message: String,
@@ -390,18 +392,18 @@ impl Emby {
             .send()
             .await?;
 
-        if response.status().is_success() {
-            let result: ScanPathsResponse = response.json().await?;
-            Ok(result)
-        } else {
-            let status = response.status();
-            let body_text = response.text().await.unwrap_or_default();
-            Err(anyhow::anyhow!(
-                "ScanPaths failed with {}: {}",
-                status,
-                body_text
-            ))
+        let status = response.status();
+        let body_text = response.text().await.unwrap_or_default();
+
+        if let Ok(result) = serde_json::from_str::<ScanPathsResponse>(&body_text) {
+            return Ok(result);
         }
+
+        Err(anyhow::anyhow!(
+            "ScanPaths failed with {}: {}",
+            status,
+            body_text
+        ))
     }
 }
 
@@ -440,7 +442,10 @@ impl TargetProcess for Emby {
                 remaining = Vec::new();
                 let result_map: HashMap<&str, &ScanPathResponse> = batch_result.results
                     .iter()
-                    .map(|r| (r.message.as_str(), r))
+                    .map(|r| {
+                        let key = if r.path.is_empty() { r.message.as_str() } else { r.path.as_str() };
+                        (key, r)
+                    })
                     .collect();
 
                 for (ev, ev_path) in &all_with_paths {

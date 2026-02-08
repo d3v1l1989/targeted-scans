@@ -128,6 +128,7 @@ public class ScanPathController : ControllerBase
                 ItemId = r.ItemId ?? string.Empty,
                 ItemName = r.ItemName ?? string.Empty,
                 Status = r.Status.ToString(),
+                Path = r.Path ?? string.Empty,
                 Message = r.Path ?? string.Empty
             }).ToList()
         });
@@ -182,6 +183,11 @@ public class ScanPathResponse
     /// Gets or sets the status.
     /// </summary>
     public string Status { get; set; } = string.Empty;
+
+    /// <summary>
+    /// Gets or sets the scanned path (populated in batch responses).
+    /// </summary>
+    public string Path { get; set; } = string.Empty;
 
     /// <summary>
     /// Gets or sets the message.

@@ -31,6 +31,7 @@ namespace EmbyTargetedScan.Api
         public string ItemId { get; set; }
         public string ItemName { get; set; }
         public string Status { get; set; }
+        public string Path { get; set; }
         public string Message { get; set; }
     }
 
@@ -98,6 +99,7 @@ namespace EmbyTargetedScan.Api
                     ItemId = r.ItemId ?? string.Empty,
                     ItemName = r.ItemName ?? string.Empty,
                     Status = r.Status.ToString(),
+                    Path = r.Path ?? string.Empty,
                     Message = r.Path ?? string.Empty
                 }).ToList()
             };

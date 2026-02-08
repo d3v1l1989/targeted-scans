@@ -16,6 +16,7 @@ namespace EmbyTargetedScan.Services
     public class TargetedScanService
     {
         private static readonly ConcurrentDictionary<string, SemaphoreSlim> _parentLocks = new ConcurrentDictionary<string, SemaphoreSlim>(StringComparer.OrdinalIgnoreCase);
+        private static readonly ConcurrentDictionary<string, SemaphoreSlim> _validateLocks = new ConcurrentDictionary<string, SemaphoreSlim>(StringComparer.OrdinalIgnoreCase);
 
         private readonly ILibraryManager _libraryManager;
         private readonly IProviderManager _providerManager;
@@ -139,32 +140,63 @@ namespace EmbyTargetedScan.Services
             finally
             {
                 parentLock.Release();
+                if (parentLock.CurrentCount == 1 && _parentLocks.Count > 50)
+                {
+                    _parentLocks.TryRemove(lockKey, out _);
+                }
             }
         }
 
         /// <summary>
-        /// Scan multiple paths in a single batch. Sorted shallowest-first so
-        /// ancestors are created before their children.
-        /// Emby does not auto-discover siblings during metadata refresh,
-        /// so every path must be scanned individually.
+        /// Scan multiple paths in a single batch. Deduplicates by parent directory —
+        /// only one representative per parent is scanned, since the parent's metadata
+        /// refresh will auto-discover all sibling items in the same folder.
         /// </summary>
         public List<ScanPathResult> ScanPaths(IEnumerable<string> paths)
         {
-            var sorted = paths
+            var unique = paths
                 .Where(p => !string.IsNullOrWhiteSpace(p))
                 .Distinct(StringComparer.OrdinalIgnoreCase)
+                .ToList();
+
+            // Group by parent directory — only scan one representative per parent
+            var groups = unique
+                .GroupBy(p => Path.GetDirectoryName(p) ?? string.Empty, StringComparer.OrdinalIgnoreCase)
+                .ToList();
+
+            var representatives = groups
+                .Select(g => g.First())
                 .OrderBy(p => p.Count(c => c == Path.DirectorySeparatorChar || c == Path.AltDirectorySeparatorChar))
                 .ToList();
 
-            _logger.Info("TargetedScan: batch scanning {0} paths", sorted.Count);
+            var siblingPaths = new HashSet<string>(
+                unique.Except(representatives, StringComparer.OrdinalIgnoreCase),
+                StringComparer.OrdinalIgnoreCase);
+
+            _logger.Info(
+                "TargetedScan: batch scanning {0} paths ({1} representatives, {2} siblings auto-discovered)",
+                unique.Count, representatives.Count, siblingPaths.Count);
 
             var pathCache = new Dictionary<string, BaseItem>(StringComparer.OrdinalIgnoreCase);
             var results = new List<ScanPathResult>();
-            foreach (var path in sorted)
+
+            // Scan representatives
+            foreach (var path in representatives)
             {
                 var result = ScanPath(path, pathCache);
                 result.Path = path;
                 results.Add(result);
+            }
+
+            // Mark siblings as Discovered — parent metadata refresh will find them
+            foreach (var path in siblingPaths)
+            {
+                results.Add(new ScanPathResult
+                {
+                    Status = ScanStatus.Discovered,
+                    Path = path,
+                    ItemName = Path.GetFileNameWithoutExtension(path)
+                });
             }
 
             return results;
@@ -183,11 +215,13 @@ namespace EmbyTargetedScan.Services
 
                 _logger.Info("TargetedScan: item was created by concurrent request ({0}), scheduling ValidateChildren in background", existing.InternalId);
                 var parentFolder = existing.GetParent() as Folder ?? knownAncestor;
-                Task.Run(() =>
+                Task.Run(async () =>
                 {
+                    var vLock = _validateLocks.GetOrAdd(parentFolder.Path, _ => new SemaphoreSlim(1, 1));
+                    await vLock.WaitAsync();
                     try
                     {
-                        parentFolder.ValidateChildren(
+                        await parentFolder.ValidateChildren(
                             new Progress<double>(),
                             CancellationToken.None,
                             new MetadataRefreshOptions(new DirectoryService(_logger, _fileSystem))
@@ -195,12 +229,20 @@ namespace EmbyTargetedScan.Services
                                 MetadataRefreshMode = MetadataRefreshMode.FullRefresh,
                                 ReplaceAllMetadata = false
                             },
-                            recursive: false).GetAwaiter().GetResult();
+                            recursive: false);
                         _logger.Info("TargetedScan: background ValidateChildren completed on {0}", parentFolder.Name);
                     }
                     catch (Exception ex)
                     {
-                        _logger.Error("TargetedScan: background ValidateChildren failed on {0}: {1}", parentFolder.Name, ex.Message);
+                        _logger.ErrorException("TargetedScan: background ValidateChildren failed on " + parentFolder.Name, ex);
+                    }
+                    finally
+                    {
+                        vLock.Release();
+                        if (vLock.CurrentCount == 1 && _validateLocks.Count > 50)
+                        {
+                            _validateLocks.TryRemove(parentFolder.Path, out _);
+                        }
                     }
                 });
 
@@ -291,11 +333,13 @@ namespace EmbyTargetedScan.Services
             // in parent cache and trigger metadata refresh. Runs in background so the API
             // response returns immediately (ValidateChildren can take 30+ seconds).
             _logger.Info("TargetedScan: scheduling ValidateChildren on {0} in background", knownAncestor.Name);
-            Task.Run(() =>
+            Task.Run(async () =>
             {
+                var vLock = _validateLocks.GetOrAdd(knownAncestor.Path, _ => new SemaphoreSlim(1, 1));
+                await vLock.WaitAsync();
                 try
                 {
-                    knownAncestor.ValidateChildren(
+                    await knownAncestor.ValidateChildren(
                         new Progress<double>(),
                         CancellationToken.None,
                         new MetadataRefreshOptions(directoryService)
@@ -303,12 +347,20 @@ namespace EmbyTargetedScan.Services
                             MetadataRefreshMode = MetadataRefreshMode.FullRefresh,
                             ReplaceAllMetadata = true
                         },
-                        recursive: true).GetAwaiter().GetResult();
+                        recursive: true);
                     _logger.Info("TargetedScan: background ValidateChildren completed on {0}", knownAncestor.Name);
                 }
                 catch (Exception ex)
                 {
-                    _logger.Error("TargetedScan: background ValidateChildren failed on {0}: {1}", knownAncestor.Name, ex.Message);
+                    _logger.ErrorException("TargetedScan: background ValidateChildren failed on " + knownAncestor.Name, ex);
+                }
+                finally
+                {
+                    vLock.Release();
+                    if (vLock.CurrentCount == 1 && _validateLocks.Count > 50)
+                    {
+                        _validateLocks.TryRemove(knownAncestor.Path, out _);
+                    }
                 }
             });
 
