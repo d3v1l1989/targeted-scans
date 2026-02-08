@@ -52,7 +52,7 @@ Sonarr/Radarr → (webhook) → Autopulse → (ScanPath API) → Jellyfin/Emby P
 
 **Option B: Manual Install**
 
-1. Download `jellyfin-targeted-scan-v1.0.0.zip` from [Releases](https://github.com/d3v1l1989/targeted-scans/releases)
+1. Download `jellyfin-targeted-scan-vX.X.X.zip` from [Releases](https://github.com/d3v1l1989/targeted-scans/releases/latest)
 2. Extract to your Jellyfin plugins directory:
    ```
    {JellyfinDataPath}/plugins/TargetedScan/
@@ -61,10 +61,10 @@ Sonarr/Radarr → (webhook) → Autopulse → (ScanPath API) → Jellyfin/Emby P
 
 #### Emby
 
-1. Download `EmbyTargetedScan.dll` from [Releases](https://github.com/d3v1l1989/targeted-scans/releases)
-2. Copy to your Emby plugins directory:
+1. Download `EmbyTargetedScan.dll` from [Releases](https://github.com/d3v1l1989/targeted-scans/releases/latest)
+2. Copy directly to your Emby plugins directory (**not** in a subfolder):
    ```
-   {EmbyConfigPath}/plugins/
+   {EmbyConfigPath}/plugins/EmbyTargetedScan.dll
    ```
 3. Restart Emby
 
@@ -336,7 +336,6 @@ Scan multiple paths in a single batch.
 | `PathNotFound` | Path does not exist on the filesystem |
 | `ParentNotFound` | Could not find a parent library item for the path |
 | `Failed` | Scan failed |
-| `Discovered` | (Batch only) Sibling will be auto-discovered by parent's metadata refresh |
 
 ---
 
