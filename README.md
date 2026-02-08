@@ -197,10 +197,11 @@ This connects your *arr apps to Autopulse. When Sonarr/Radarr downloads or renam
    - **Username:** your autopulse `auth.username`
    - **Password:** your autopulse `auth.password`
 3. Select events:
-   - **On Download**
+   - **On File Import**
+   - **On File Upgrade**
+   - **On Import Complete**
    - **On Episode File Delete**
-   - **On Series Delete**
-   - **On Rename**
+   - **On Episode File Delete For Upgrade**
 4. Click **Test** then **Save**
 
 #### Radarr
@@ -213,10 +214,10 @@ This connects your *arr apps to Autopulse. When Sonarr/Radarr downloads or renam
    - **Username:** your autopulse `auth.username`
    - **Password:** your autopulse `auth.password`
 3. Select events:
-   - **On Download**
+   - **On File Import**
+   - **On File Upgrade**
    - **On Movie File Delete**
-   - **On Movie Delete**
-   - **On Rename**
+   - **On Movie File Delete For Upgrade**
 4. Click **Test** then **Save**
 
 #### Multiple Instances
