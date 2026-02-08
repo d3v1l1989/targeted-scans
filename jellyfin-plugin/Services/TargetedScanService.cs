@@ -272,6 +272,7 @@ public class TargetedScanService
         var directoryService = new DirectoryService(_fileSystem);
         Folder currentParent = knownAncestor;
         BaseItem? lastCreated = null;
+        Folder? firstCreatedFolder = null;
 
         foreach (var missingPath in missingPaths)
         {
@@ -328,6 +329,7 @@ public class TargetedScanService
 
             if (newItem is Folder folder)
             {
+                firstCreatedFolder ??= folder;
                 currentParent = folder;
             }
             else
@@ -342,17 +344,19 @@ public class TargetedScanService
             return Task.FromResult(new ScanPathResult { Status = ScanStatus.Failed });
         }
 
-        // Queue metadata refresh for the known ancestor and all parents up the chain.
+        // Queue metadata refresh for ancestors between knownAncestor and the library root.
         // When knownAncestor is a Season, this ensures the parent Series also gets
         // identified by providers — episode metadata depends on Series being identified first.
+        // Skip library root folders (their parent is null or is a system root).
         var ancestorsToRefresh = new List<BaseItem>();
         var walkItem = knownAncestor as BaseItem;
         while (walkItem != null)
         {
-            if (walkItem is CollectionFolder || walkItem is UserRootFolder || walkItem is AggregateFolder)
+            var parent = walkItem.GetParent();
+            if (parent == null || parent is UserRootFolder || parent is AggregateFolder)
                 break;
             ancestorsToRefresh.Add(walkItem);
-            walkItem = walkItem.GetParent();
+            walkItem = parent;
         }
 
         // Refresh top-down (Series before Season) so provider IDs cascade
@@ -371,41 +375,52 @@ public class TargetedScanService
                 ancestor.Name, ancestor.GetType().Name);
         }
 
-        // Fire-and-forget ValidateChildren on the ancestor to properly register items
-        // in parent cache and trigger metadata refresh. Runs in background so the API
-        // response returns immediately (ValidateChildren can take 30+ seconds).
-        _logger.LogInformation("TargetedScan: scheduling ValidateChildren on {AncestorName} in background", knownAncestor.Name);
-        _ = Task.Run(async () =>
+        // Fire-and-forget ValidateChildren on the first created folder (e.g. Series)
+        // to register children in parent cache. Use firstCreatedFolder instead of
+        // knownAncestor to avoid running ValidateChildren on the entire library root.
+        // Skip entirely when target is a library root (movies don't create folders,
+        // so firstCreatedFolder is null and knownAncestor is the library root).
+        var validateTarget = firstCreatedFolder ?? knownAncestor;
+        var validateParent = validateTarget.GetParent();
+        if (validateParent == null || validateParent is UserRootFolder || validateParent is AggregateFolder)
         {
-            var vLock = _validateLocks.GetOrAdd(knownAncestor.Path, _ => new SemaphoreSlim(1, 1));
-            await vLock.WaitAsync().ConfigureAwait(false);
-            try
+            _logger.LogInformation("TargetedScan: skipping ValidateChildren on library root {TargetName}, per-item QueueRefresh is sufficient", validateTarget.Name);
+        }
+        else
+        {
+            _logger.LogInformation("TargetedScan: scheduling ValidateChildren on {TargetName} in background", validateTarget.Name);
+            _ = Task.Run(async () =>
             {
-                await knownAncestor.ValidateChildren(
-                    new Progress<double>(),
-                    new MetadataRefreshOptions(directoryService)
-                    {
-                        MetadataRefreshMode = MetadataRefreshMode.FullRefresh,
-                        ReplaceAllMetadata = true
-                    },
-                    recursive: true,
-                    allowRemoveRoot: false,
-                    CancellationToken.None).ConfigureAwait(false);
-                _logger.LogInformation("TargetedScan: background ValidateChildren completed on {AncestorName}", knownAncestor.Name);
-            }
-            catch (Exception ex)
-            {
-                _logger.LogError(ex, "TargetedScan: background ValidateChildren failed on {AncestorName}", knownAncestor.Name);
-            }
-            finally
-            {
-                vLock.Release();
-                if (vLock.CurrentCount == 1 && _validateLocks.Count > 50)
+                var vLock = _validateLocks.GetOrAdd(validateTarget.Path, _ => new SemaphoreSlim(1, 1));
+                await vLock.WaitAsync().ConfigureAwait(false);
+                try
                 {
-                    _validateLocks.TryRemove(knownAncestor.Path, out _);
+                    await validateTarget.ValidateChildren(
+                        new Progress<double>(),
+                        new MetadataRefreshOptions(directoryService)
+                        {
+                            MetadataRefreshMode = MetadataRefreshMode.FullRefresh,
+                            ReplaceAllMetadata = true
+                        },
+                        recursive: true,
+                        allowRemoveRoot: false,
+                        CancellationToken.None).ConfigureAwait(false);
+                    _logger.LogInformation("TargetedScan: background ValidateChildren completed on {TargetName}", validateTarget.Name);
                 }
-            }
-        });
+                catch (Exception ex)
+                {
+                    _logger.LogError(ex, "TargetedScan: background ValidateChildren failed on {TargetName}", validateTarget.Name);
+                }
+                finally
+                {
+                    vLock.Release();
+                    if (vLock.CurrentCount == 1 && _validateLocks.Count > 50)
+                    {
+                        _validateLocks.TryRemove(validateTarget.Path, out _);
+                    }
+                }
+            });
+        }
 
         return Task.FromResult(new ScanPathResult
         {

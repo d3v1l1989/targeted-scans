@@ -264,6 +264,7 @@ namespace EmbyTargetedScan.Services
             var directoryService = new DirectoryService(_logger, _fileSystem);
             Folder currentParent = knownAncestor;
             BaseItem lastCreated = null;
+            Folder firstCreatedFolder = null;
 
             foreach (var missingPath in missingPaths)
             {
@@ -326,6 +327,7 @@ namespace EmbyTargetedScan.Services
 
                 if (newItem is Folder folder)
                 {
+                    if (firstCreatedFolder == null) firstCreatedFolder = folder;
                     currentParent = folder;
                 }
                 else
@@ -340,17 +342,19 @@ namespace EmbyTargetedScan.Services
                 return new ScanPathResult { Status = ScanStatus.Failed };
             }
 
-            // Queue metadata refresh for the known ancestor and all parents up the chain.
+            // Queue metadata refresh for ancestors between knownAncestor and the library root.
             // When knownAncestor is a Season, this ensures the parent Series also gets
             // identified by providers — episode metadata depends on Series being identified first.
+            // Skip library root folders (their parent is null or is a system root).
             var ancestorsToRefresh = new List<BaseItem>();
             var walkItem = knownAncestor as BaseItem;
             while (walkItem != null)
             {
-                if (walkItem is CollectionFolder || walkItem is UserRootFolder || walkItem is AggregateFolder)
+                var parent = walkItem.GetParent();
+                if (parent == null || parent is UserRootFolder || parent is AggregateFolder)
                     break;
                 ancestorsToRefresh.Add(walkItem);
-                walkItem = walkItem.GetParent();
+                walkItem = parent;
             }
 
             // Refresh top-down (Series before Season) so provider IDs cascade
@@ -369,40 +373,51 @@ namespace EmbyTargetedScan.Services
                     ancestor.Name, ancestor.GetType().Name);
             }
 
-            // Fire-and-forget ValidateChildren on the ancestor to properly register items
-            // in parent cache and trigger metadata refresh. Runs in background so the API
-            // response returns immediately (ValidateChildren can take 30+ seconds).
-            _logger.Info("TargetedScan: scheduling ValidateChildren on {0} in background", knownAncestor.Name);
-            Task.Run(async () =>
+            // Fire-and-forget ValidateChildren on the first created folder (e.g. Series)
+            // to register children in parent cache. Use firstCreatedFolder instead of
+            // knownAncestor to avoid running ValidateChildren on the entire library root.
+            // Skip entirely when target is a library root (movies don't create folders,
+            // so firstCreatedFolder is null and knownAncestor is the library root).
+            var validateTarget = firstCreatedFolder ?? knownAncestor;
+            var validateParent = validateTarget.GetParent();
+            if (validateParent == null || validateParent is UserRootFolder || validateParent is AggregateFolder)
             {
-                var vLock = _validateLocks.GetOrAdd(knownAncestor.Path, _ => new SemaphoreSlim(1, 1));
-                await vLock.WaitAsync();
-                try
+                _logger.Info("TargetedScan: skipping ValidateChildren on library root {0}, per-item QueueRefresh is sufficient", validateTarget.Name);
+            }
+            else
+            {
+                _logger.Info("TargetedScan: scheduling ValidateChildren on {0} in background", validateTarget.Name);
+                Task.Run(async () =>
                 {
-                    await knownAncestor.ValidateChildren(
-                        new Progress<double>(),
-                        CancellationToken.None,
-                        new MetadataRefreshOptions(directoryService)
-                        {
-                            MetadataRefreshMode = MetadataRefreshMode.FullRefresh,
-                            ReplaceAllMetadata = true
-                        },
-                        recursive: true);
-                    _logger.Info("TargetedScan: background ValidateChildren completed on {0}", knownAncestor.Name);
-                }
-                catch (Exception ex)
-                {
-                    _logger.ErrorException("TargetedScan: background ValidateChildren failed on " + knownAncestor.Name, ex);
-                }
-                finally
-                {
-                    vLock.Release();
-                    if (vLock.CurrentCount == 1 && _validateLocks.Count > 50)
+                    var vLock = _validateLocks.GetOrAdd(validateTarget.Path, _ => new SemaphoreSlim(1, 1));
+                    await vLock.WaitAsync();
+                    try
                     {
-                        _validateLocks.TryRemove(knownAncestor.Path, out _);
+                        await validateTarget.ValidateChildren(
+                            new Progress<double>(),
+                            CancellationToken.None,
+                            new MetadataRefreshOptions(directoryService)
+                            {
+                                MetadataRefreshMode = MetadataRefreshMode.FullRefresh,
+                                ReplaceAllMetadata = true
+                            },
+                            recursive: true);
+                        _logger.Info("TargetedScan: background ValidateChildren completed on {0}", validateTarget.Name);
                     }
-                }
-            });
+                    catch (Exception ex)
+                    {
+                        _logger.ErrorException("TargetedScan: background ValidateChildren failed on " + validateTarget.Name, ex);
+                    }
+                    finally
+                    {
+                        vLock.Release();
+                        if (vLock.CurrentCount == 1 && _validateLocks.Count > 50)
+                        {
+                            _validateLocks.TryRemove(validateTarget.Path, out _);
+                        }
+                    }
+                });
+            }
 
             return new ScanPathResult
             {
