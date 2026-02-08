@@ -312,6 +312,17 @@ public class TargetedScanService
             _libraryManager.CreateItem(newItem, currentParent);
             _logger.LogInformation("TargetedScan: created {ItemName} ({ItemId})", newItem.Name, newItem.Id);
 
+            // Queue metadata refresh immediately so providers identify the item
+            _providerManager.QueueRefresh(
+                newItem.Id,
+                new MetadataRefreshOptions(directoryService)
+                {
+                    MetadataRefreshMode = MetadataRefreshMode.FullRefresh,
+                    ReplaceAllMetadata = true
+                },
+                RefreshPriority.High);
+            _logger.LogInformation("TargetedScan: queued metadata refresh for {ItemName}", newItem.Name);
+
             cache?.TryAdd(missingPath, newItem);
             lastCreated = newItem;
 
@@ -329,6 +340,35 @@ public class TargetedScanService
         if (lastCreated == null)
         {
             return Task.FromResult(new ScanPathResult { Status = ScanStatus.Failed });
+        }
+
+        // Queue metadata refresh for the known ancestor and all parents up the chain.
+        // When knownAncestor is a Season, this ensures the parent Series also gets
+        // identified by providers — episode metadata depends on Series being identified first.
+        var ancestorsToRefresh = new List<BaseItem>();
+        var walkItem = knownAncestor as BaseItem;
+        while (walkItem != null)
+        {
+            if (walkItem is CollectionFolder || walkItem is UserRootFolder || walkItem is AggregateFolder)
+                break;
+            ancestorsToRefresh.Add(walkItem);
+            walkItem = walkItem.GetParent();
+        }
+
+        // Refresh top-down (Series before Season) so provider IDs cascade
+        ancestorsToRefresh.Reverse();
+        foreach (var ancestor in ancestorsToRefresh)
+        {
+            _providerManager.QueueRefresh(
+                ancestor.Id,
+                new MetadataRefreshOptions(directoryService)
+                {
+                    MetadataRefreshMode = MetadataRefreshMode.FullRefresh,
+                    ReplaceAllMetadata = false
+                },
+                RefreshPriority.High);
+            _logger.LogInformation("TargetedScan: queued ancestor refresh for {Name} ({Type})",
+                ancestor.Name, ancestor.GetType().Name);
         }
 
         // Fire-and-forget ValidateChildren on the ancestor to properly register items
