@@ -4,6 +4,7 @@ using System.Collections.Generic;
 using System.IO;
 using System.Linq;
 using System.Threading;
+using System.Threading.Tasks;
 using MediaBrowser.Controller.Entities;
 using MediaBrowser.Controller.Library;
 using MediaBrowser.Controller.Providers;
@@ -180,17 +181,28 @@ namespace EmbyTargetedScan.Services
                     cache[path] = existing;
                 }
 
-                _logger.Info("TargetedScan: item was created by concurrent request ({0}), refreshing via ValidateChildren", existing.InternalId);
+                _logger.Info("TargetedScan: item was created by concurrent request ({0}), scheduling ValidateChildren in background", existing.InternalId);
                 var parentFolder = existing.GetParent() as Folder ?? knownAncestor;
-                parentFolder.ValidateChildren(
-                    new Progress<double>(),
-                    CancellationToken.None,
-                    new MetadataRefreshOptions(new DirectoryService(_logger, _fileSystem))
+                Task.Run(() =>
+                {
+                    try
                     {
-                        MetadataRefreshMode = MetadataRefreshMode.FullRefresh,
-                        ReplaceAllMetadata = false
-                    },
-                    recursive: false).GetAwaiter().GetResult();
+                        parentFolder.ValidateChildren(
+                            new Progress<double>(),
+                            CancellationToken.None,
+                            new MetadataRefreshOptions(new DirectoryService(_logger, _fileSystem))
+                            {
+                                MetadataRefreshMode = MetadataRefreshMode.FullRefresh,
+                                ReplaceAllMetadata = false
+                            },
+                            recursive: false).GetAwaiter().GetResult();
+                        _logger.Info("TargetedScan: background ValidateChildren completed on {0}", parentFolder.Name);
+                    }
+                    catch (Exception ex)
+                    {
+                        _logger.Error("TargetedScan: background ValidateChildren failed on {0}: {1}", parentFolder.Name, ex.Message);
+                    }
+                });
 
                 return new ScanPathResult
                 {
@@ -275,20 +287,30 @@ namespace EmbyTargetedScan.Services
                 return new ScanPathResult { Status = ScanStatus.Failed };
             }
 
-            // ValidateChildren on the ancestor to properly register items in parent cache
-            // and trigger metadata refresh. This replaces QueueRefresh which doesn't work
-            // for items created via CreateItem (the refresh queue ignores them).
-            _logger.Info("TargetedScan: running ValidateChildren on {0}", knownAncestor.Name);
-            knownAncestor.ValidateChildren(
-                new Progress<double>(),
-                CancellationToken.None,
-                new MetadataRefreshOptions(directoryService)
+            // Fire-and-forget ValidateChildren on the ancestor to properly register items
+            // in parent cache and trigger metadata refresh. Runs in background so the API
+            // response returns immediately (ValidateChildren can take 30+ seconds).
+            _logger.Info("TargetedScan: scheduling ValidateChildren on {0} in background", knownAncestor.Name);
+            Task.Run(() =>
+            {
+                try
                 {
-                    MetadataRefreshMode = MetadataRefreshMode.FullRefresh,
-                    ReplaceAllMetadata = true
-                },
-                recursive: true).GetAwaiter().GetResult();
-            _logger.Info("TargetedScan: ValidateChildren completed on {0}", knownAncestor.Name);
+                    knownAncestor.ValidateChildren(
+                        new Progress<double>(),
+                        CancellationToken.None,
+                        new MetadataRefreshOptions(directoryService)
+                        {
+                            MetadataRefreshMode = MetadataRefreshMode.FullRefresh,
+                            ReplaceAllMetadata = true
+                        },
+                        recursive: true).GetAwaiter().GetResult();
+                    _logger.Info("TargetedScan: background ValidateChildren completed on {0}", knownAncestor.Name);
+                }
+                catch (Exception ex)
+                {
+                    _logger.Error("TargetedScan: background ValidateChildren failed on {0}: {1}", knownAncestor.Name, ex.Message);
+                }
+            });
 
             return new ScanPathResult
             {

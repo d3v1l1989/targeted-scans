@@ -105,11 +105,14 @@ struct ScanPathsRequest {
 #[serde(rename_all = "PascalCase")]
 #[doc(hidden)]
 struct ScanPathResponse {
+    #[serde(default)]
     item_id: String,
     #[allow(dead_code)]
+    #[serde(default)]
     item_name: String,
     status: String,
     #[allow(dead_code)]
+    #[serde(default)]
     message: String,
 }
 
@@ -339,7 +342,8 @@ impl Emby {
     }
 
     /// Attempt a targeted scan via the TargetedScan plugin's POST /Library/ScanPath endpoint.
-    /// Returns Ok with the response on success, or Err if the plugin is not installed or fails.
+    /// Returns Ok with the response on success (including PathNotFound/ParentNotFound),
+    /// or Err if the plugin is not installed or the response cannot be parsed.
     async fn targeted_scan(&self, path: &str) -> anyhow::Result<ScanPathResponse> {
         let client = self.get_client()?;
         let url = get_url(&self.url)?.join("Library/ScanPath")?;
@@ -355,18 +359,20 @@ impl Emby {
             .send()
             .await?;
 
-        if response.status().is_success() {
-            let result: ScanPathResponse = response.json().await?;
-            Ok(result)
-        } else {
-            let status = response.status();
-            let body_text = response.text().await.unwrap_or_default();
-            Err(anyhow::anyhow!(
-                "ScanPath failed with {}: {}",
-                status,
-                body_text
-            ))
+        let status = response.status();
+        let body_text = response.text().await.unwrap_or_default();
+
+        // Parse response body even for non-200 statuses — Jellyfin returns 404
+        // with a valid JSON body for PathNotFound/ParentNotFound
+        if let Ok(result) = serde_json::from_str::<ScanPathResponse>(&body_text) {
+            return Ok(result);
         }
+
+        Err(anyhow::anyhow!(
+            "ScanPath failed with {}: {}",
+            status,
+            body_text
+        ))
     }
 
     /// Batch targeted scan via POST /Library/ScanPaths.
@@ -446,6 +452,13 @@ impl TargetProcess for Emby {
                             );
                             *succeeded.entry(ev.id.clone()).or_insert(true) &= true;
                         }
+                        Some(r) if r.status == "PathNotFound" || r.status == "ParentNotFound" => {
+                            debug!(
+                                "path no longer exists for {} ({}), skipping",
+                                ev_path, r.status
+                            );
+                            *succeeded.entry(ev.id.clone()).or_insert(true) &= true;
+                        }
                         _ => {
                             remaining.push((*ev, ev_path.clone()));
                         }
@@ -486,6 +499,16 @@ impl TargetProcess for Emby {
             let mut still_remaining = Vec::new();
             for (ev, ev_path, result) in results {
                 match result {
+                    Ok(scan_result)
+                        if scan_result.status == "PathNotFound"
+                            || scan_result.status == "ParentNotFound" =>
+                    {
+                        debug!(
+                            "path no longer exists for {} ({}), skipping",
+                            ev_path, scan_result.status
+                        );
+                        *succeeded.entry(ev.id.clone()).or_insert(true) &= true;
+                    }
                     Ok(scan_result) => {
                         info!(
                             "targeted scan succeeded for {}: {} ({})",

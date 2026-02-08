@@ -215,18 +215,29 @@ public class TargetedScanService
             cache?.Remove(path);
             cache?.TryAdd(path, existing);
 
-            _logger.LogInformation("TargetedScan: item was created by concurrent request ({Id}), refreshing via ValidateChildren", existing.Id);
+            _logger.LogInformation("TargetedScan: item was created by concurrent request ({Id}), scheduling ValidateChildren in background", existing.Id);
             var parentFolder = existing.GetParent() as Folder ?? knownAncestor;
-            await parentFolder.ValidateChildren(
-                new Progress<double>(),
-                new MetadataRefreshOptions(new DirectoryService(_fileSystem))
+            _ = Task.Run(async () =>
+            {
+                try
                 {
-                    MetadataRefreshMode = MetadataRefreshMode.FullRefresh,
-                    ReplaceAllMetadata = false
-                },
-                recursive: false,
-                allowRemoveRoot: false,
-                CancellationToken.None).ConfigureAwait(false);
+                    await parentFolder.ValidateChildren(
+                        new Progress<double>(),
+                        new MetadataRefreshOptions(new DirectoryService(_fileSystem))
+                        {
+                            MetadataRefreshMode = MetadataRefreshMode.FullRefresh,
+                            ReplaceAllMetadata = false
+                        },
+                        recursive: false,
+                        allowRemoveRoot: false,
+                        CancellationToken.None).ConfigureAwait(false);
+                    _logger.LogInformation("TargetedScan: background ValidateChildren completed on {ParentName}", parentFolder.Name);
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogError(ex, "TargetedScan: background ValidateChildren failed on {ParentName}", parentFolder.Name);
+                }
+            });
 
             return new ScanPathResult
             {
@@ -305,21 +316,31 @@ public class TargetedScanService
             return new ScanPathResult { Status = ScanStatus.Failed };
         }
 
-        // ValidateChildren on the ancestor to properly register items in parent cache
-        // and trigger metadata refresh. This replaces QueueRefresh which doesn't work
-        // for items created via CreateItem (the refresh queue ignores them).
-        _logger.LogInformation("TargetedScan: running ValidateChildren on {AncestorName}", knownAncestor.Name);
-        await knownAncestor.ValidateChildren(
-            new Progress<double>(),
-            new MetadataRefreshOptions(directoryService)
+        // Fire-and-forget ValidateChildren on the ancestor to properly register items
+        // in parent cache and trigger metadata refresh. Runs in background so the API
+        // response returns immediately (ValidateChildren can take 30+ seconds).
+        _logger.LogInformation("TargetedScan: scheduling ValidateChildren on {AncestorName} in background", knownAncestor.Name);
+        _ = Task.Run(async () =>
+        {
+            try
             {
-                MetadataRefreshMode = MetadataRefreshMode.FullRefresh,
-                ReplaceAllMetadata = true
-            },
-            recursive: true,
-            allowRemoveRoot: false,
-            CancellationToken.None).ConfigureAwait(false);
-        _logger.LogInformation("TargetedScan: ValidateChildren completed on {AncestorName}", knownAncestor.Name);
+                await knownAncestor.ValidateChildren(
+                    new Progress<double>(),
+                    new MetadataRefreshOptions(directoryService)
+                    {
+                        MetadataRefreshMode = MetadataRefreshMode.FullRefresh,
+                        ReplaceAllMetadata = true
+                    },
+                    recursive: true,
+                    allowRemoveRoot: false,
+                    CancellationToken.None).ConfigureAwait(false);
+                _logger.LogInformation("TargetedScan: background ValidateChildren completed on {AncestorName}", knownAncestor.Name);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "TargetedScan: background ValidateChildren failed on {AncestorName}", knownAncestor.Name);
+            }
+        });
 
         return new ScanPathResult
         {
