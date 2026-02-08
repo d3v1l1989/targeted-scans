@@ -4,7 +4,6 @@ using System.Collections.Generic;
 using System.IO;
 using System.Linq;
 using System.Threading;
-using System.Threading.Tasks;
 using MediaBrowser.Controller.Entities;
 using MediaBrowser.Controller.Library;
 using MediaBrowser.Controller.Providers;
@@ -16,7 +15,6 @@ namespace EmbyTargetedScan.Services
     public class TargetedScanService
     {
         private static readonly ConcurrentDictionary<string, SemaphoreSlim> _parentLocks = new ConcurrentDictionary<string, SemaphoreSlim>(StringComparer.OrdinalIgnoreCase);
-        private static readonly ConcurrentDictionary<string, SemaphoreSlim> _validateLocks = new ConcurrentDictionary<string, SemaphoreSlim>(StringComparer.OrdinalIgnoreCase);
 
         private readonly ILibraryManager _libraryManager;
         private readonly IProviderManager _providerManager;
@@ -108,7 +106,7 @@ namespace EmbyTargetedScan.Services
                     new MetadataRefreshOptions(new DirectoryService(_logger, _fileSystem))
                     {
                         MetadataRefreshMode = MetadataRefreshMode.FullRefresh,
-                        ReplaceAllMetadata = false
+                        ReplaceAllMetadata = true
                     },
                     RefreshPriority.High);
 
@@ -157,46 +155,19 @@ namespace EmbyTargetedScan.Services
             var unique = paths
                 .Where(p => !string.IsNullOrWhiteSpace(p))
                 .Distinct(StringComparer.OrdinalIgnoreCase)
-                .ToList();
-
-            // Group by parent directory — only scan one representative per parent
-            var groups = unique
-                .GroupBy(p => Path.GetDirectoryName(p) ?? string.Empty, StringComparer.OrdinalIgnoreCase)
-                .ToList();
-
-            var representatives = groups
-                .Select(g => g.First())
                 .OrderBy(p => p.Count(c => c == Path.DirectorySeparatorChar || c == Path.AltDirectorySeparatorChar))
                 .ToList();
 
-            var siblingPaths = new HashSet<string>(
-                unique.Except(representatives, StringComparer.OrdinalIgnoreCase),
-                StringComparer.OrdinalIgnoreCase);
-
-            _logger.Info(
-                "TargetedScan: batch scanning {0} paths ({1} representatives, {2} siblings auto-discovered)",
-                unique.Count, representatives.Count, siblingPaths.Count);
+            _logger.Info("TargetedScan: batch scanning {0} paths", unique.Count);
 
             var pathCache = new Dictionary<string, BaseItem>(StringComparer.OrdinalIgnoreCase);
             var results = new List<ScanPathResult>();
 
-            // Scan representatives
-            foreach (var path in representatives)
+            foreach (var path in unique)
             {
                 var result = ScanPath(path, pathCache);
                 result.Path = path;
                 results.Add(result);
-            }
-
-            // Mark siblings as Discovered — parent metadata refresh will find them
-            foreach (var path in siblingPaths)
-            {
-                results.Add(new ScanPathResult
-                {
-                    Status = ScanStatus.Discovered,
-                    Path = path,
-                    ItemName = Path.GetFileNameWithoutExtension(path)
-                });
             }
 
             return results;
@@ -213,38 +184,15 @@ namespace EmbyTargetedScan.Services
                     cache[path] = existing;
                 }
 
-                _logger.Info("TargetedScan: item was created by concurrent request ({0}), scheduling ValidateChildren in background", existing.InternalId);
-                var parentFolder = existing.GetParent() as Folder ?? knownAncestor;
-                Task.Run(async () =>
-                {
-                    var vLock = _validateLocks.GetOrAdd(parentFolder.Path, _ => new SemaphoreSlim(1, 1));
-                    await vLock.WaitAsync();
-                    try
+                _logger.Info("TargetedScan: item was created by concurrent request ({0}), queuing refresh", existing.InternalId);
+                _providerManager.QueueRefresh(
+                    existing.InternalId,
+                    new MetadataRefreshOptions(new DirectoryService(_logger, _fileSystem))
                     {
-                        await parentFolder.ValidateChildren(
-                            new Progress<double>(),
-                            CancellationToken.None,
-                            new MetadataRefreshOptions(new DirectoryService(_logger, _fileSystem))
-                            {
-                                MetadataRefreshMode = MetadataRefreshMode.FullRefresh,
-                                ReplaceAllMetadata = false
-                            },
-                            recursive: false);
-                        _logger.Info("TargetedScan: background ValidateChildren completed on {0}", parentFolder.Name);
-                    }
-                    catch (Exception ex)
-                    {
-                        _logger.ErrorException("TargetedScan: background ValidateChildren failed on " + parentFolder.Name, ex);
-                    }
-                    finally
-                    {
-                        vLock.Release();
-                        if (vLock.CurrentCount == 1 && _validateLocks.Count > 50)
-                        {
-                            _validateLocks.TryRemove(parentFolder.Path, out _);
-                        }
-                    }
-                });
+                        MetadataRefreshMode = MetadataRefreshMode.FullRefresh,
+                        ReplaceAllMetadata = true
+                    },
+                    RefreshPriority.High);
 
                 return new ScanPathResult
                 {
@@ -264,8 +212,6 @@ namespace EmbyTargetedScan.Services
             var directoryService = new DirectoryService(_logger, _fileSystem);
             Folder currentParent = knownAncestor;
             BaseItem lastCreated = null;
-            Folder firstCreatedFolder = null;
-
             foreach (var missingPath in missingPaths)
             {
                 // Re-check: a concurrent request (before we held the lock) may have created this
@@ -327,7 +273,6 @@ namespace EmbyTargetedScan.Services
 
                 if (newItem is Folder folder)
                 {
-                    if (firstCreatedFolder == null) firstCreatedFolder = folder;
                     currentParent = folder;
                 }
                 else
@@ -371,52 +316,6 @@ namespace EmbyTargetedScan.Services
                     RefreshPriority.High);
                 _logger.Info("TargetedScan: queued ancestor refresh for {0} ({1})",
                     ancestor.Name, ancestor.GetType().Name);
-            }
-
-            // Fire-and-forget ValidateChildren on the first created folder (e.g. Series)
-            // to register children in parent cache. Use firstCreatedFolder instead of
-            // knownAncestor to avoid running ValidateChildren on the entire library root.
-            // Skip entirely when target is a library root (movies don't create folders,
-            // so firstCreatedFolder is null and knownAncestor is the library root).
-            var validateTarget = firstCreatedFolder ?? knownAncestor;
-            var validateParent = validateTarget.GetParent();
-            if (validateParent == null || validateParent is UserRootFolder || validateParent is AggregateFolder)
-            {
-                _logger.Info("TargetedScan: skipping ValidateChildren on library root {0}, per-item QueueRefresh is sufficient", validateTarget.Name);
-            }
-            else
-            {
-                _logger.Info("TargetedScan: scheduling ValidateChildren on {0} in background", validateTarget.Name);
-                Task.Run(async () =>
-                {
-                    var vLock = _validateLocks.GetOrAdd(validateTarget.Path, _ => new SemaphoreSlim(1, 1));
-                    await vLock.WaitAsync();
-                    try
-                    {
-                        await validateTarget.ValidateChildren(
-                            new Progress<double>(),
-                            CancellationToken.None,
-                            new MetadataRefreshOptions(directoryService)
-                            {
-                                MetadataRefreshMode = MetadataRefreshMode.FullRefresh,
-                                ReplaceAllMetadata = true
-                            },
-                            recursive: true);
-                        _logger.Info("TargetedScan: background ValidateChildren completed on {0}", validateTarget.Name);
-                    }
-                    catch (Exception ex)
-                    {
-                        _logger.ErrorException("TargetedScan: background ValidateChildren failed on " + validateTarget.Name, ex);
-                    }
-                    finally
-                    {
-                        vLock.Release();
-                        if (vLock.CurrentCount == 1 && _validateLocks.Count > 50)
-                        {
-                            _validateLocks.TryRemove(validateTarget.Path, out _);
-                        }
-                    }
-                });
             }
 
             return new ScanPathResult
