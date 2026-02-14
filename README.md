@@ -95,7 +95,7 @@ services:
       - AUTOPULSE__APP__DATABASE_URL=sqlite://data/autopulse.db
     volumes:
       - ./data:/app                # config.yaml goes here
-      - /mnt:/mnt                  # mount your media paths (must match Sonarr/Radarr paths)
+      - /mnt:/mnt:rslave            # mount your media paths (must match Sonarr/Radarr paths)
       - /etc/localtime:/etc/localtime:ro
     ports:
       - "2875:2875"
