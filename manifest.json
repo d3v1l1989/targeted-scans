@@ -9,6 +9,14 @@
     "imageUrl": "https://raw.githubusercontent.com/d3v1l1989/targeted-scans/main/jellyfin-plugin/thumb.png",
     "versions": [
       {
+        "version": "1.8.0.0",
+        "changelog": "Auto-remove stale items on file upgrades, use Default refresh mode for ancestors to prevent cascading ValidateChildren storms, lower refresh priority to Normal to avoid starving active streams",
+        "targetAbi": "10.11.0.0",
+        "sourceUrl": "https://github.com/d3v1l1989/targeted-scans/releases/download/v1.8.0/jellyfin-targeted-scan-v1.8.0.zip",
+        "checksum": "2ec91fda5d442270a02d59b2900cbae3",
+        "timestamp": "2026-02-20T00:00:00Z"
+      },
+      {
         "version": "1.7.0.0",
         "changelog": "Remove ValidateChildren entirely, process all paths through CreateItem individually for reliable metadata resolution",
         "targetAbi": "10.11.0.0",
