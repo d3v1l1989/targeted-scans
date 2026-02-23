@@ -125,6 +125,14 @@ namespace EmbyTargetedScan.Api
                         Status = "Refreshed",
                         Message = "Existing item found, metadata refresh queued"
                     };
+                case ScanStatus.Removed:
+                    return new ScanPathResponse
+                    {
+                        ItemId = result.ItemId ?? string.Empty,
+                        ItemName = result.ItemName ?? string.Empty,
+                        Status = "Removed",
+                        Message = "Stale item removed — file no longer exists"
+                    };
                 case ScanStatus.PathNotFound:
                     return new ScanPathResponse
                     {

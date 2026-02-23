@@ -9,6 +9,7 @@ using MediaBrowser.Controller.Entities;
 using MediaBrowser.Controller.Library;
 using MediaBrowser.Controller.Providers;
 using MediaBrowser.Model.IO;
+using Jellyfin.Data.Enums;
 using Microsoft.Extensions.Logging;
 
 namespace JellyfinTargetedScan.Services;
@@ -68,6 +69,34 @@ public class TargetedScanService
 
             if (found is Folder folder)
             {
+                // Skip plain Folder items — they are generic containers (e.g. movie
+                // folders created by a prior library scan) that cause video files to
+                // resolve as Video instead of Movie/Episode. Only stop at properly-typed
+                // subclasses: Series, Season, CollectionFolder, BoxSet, etc.
+                // Walking past plain Folders lets us reach the library root so
+                // ResolvePath creates items with the correct type.
+                if (found.GetType() == typeof(Folder))
+                {
+                    // Plain Folder items are generic containers. However, library
+                    // location folders (e.g. /mnt/plex/Movies) are legitimately plain
+                    // Folders whose parent is the CollectionFolder. These are safe to
+                    // use as ancestors — ResolvePath under them creates correct types.
+                    // Only skip plain Folders whose parent is NOT a CollectionFolder
+                    // (i.e. movie subfolders like /mnt/plex/Movies/Southpaw (2015)).
+                    var folderParent = folder.GetParent();
+                    if (folderParent != null && folderParent.GetType() != typeof(Folder))
+                    {
+                        // Parent is a properly-typed item (CollectionFolder, AggregateFolder, etc.)
+                        // — this Folder is a library location root, safe to use as ancestor.
+                        knownAncestor = folder;
+                        break;
+                    }
+
+                    missingPaths.Add(current);
+                    current = Path.GetDirectoryName(current);
+                    continue;
+                }
+
                 knownAncestor = folder;
                 break;
             }
@@ -92,6 +121,29 @@ public class TargetedScanService
         // 1. Verify path exists on filesystem
         if (!Directory.Exists(path) && !File.Exists(path))
         {
+            // Check if there's a stale database entry to clean up (upgrade scenario:
+            // Sonarr/Radarr deleted the old file and sent us the deleted path)
+            var staleItem = _libraryManager.FindByPath(path, null);
+            if (staleItem != null)
+            {
+                _logger.LogInformation(
+                    "TargetedScan: removing stale item {Name} ({Id}) — file no longer exists: {Path}",
+                    staleItem.Name, staleItem.Id, path);
+                var parent = staleItem.GetParent();
+                _libraryManager.DeleteItem(staleItem, new DeleteOptions
+                {
+                    DeleteFileLocation = false,
+                    DeleteFromExternalProvider = false
+                }, parent, false);
+                cache?.Remove(path);
+                return new ScanPathResult
+                {
+                    Status = ScanStatus.Removed,
+                    ItemId = staleItem.Id.ToString("N"),
+                    ItemName = staleItem.Name
+                };
+            }
+
             _logger.LogWarning("TargetedScan: path does not exist on filesystem: {Path}", path);
             return new ScanPathResult { Status = ScanStatus.PathNotFound };
         }
@@ -110,22 +162,53 @@ public class TargetedScanService
 
         if (existing != null)
         {
-            _logger.LogInformation("TargetedScan: item already exists ({Id}), queuing refresh", existing.Id);
-            _providerManager.QueueRefresh(
-                existing.Id,
-                new MetadataRefreshOptions(new DirectoryService(_fileSystem))
-                {
-                    MetadataRefreshMode = MetadataRefreshMode.FullRefresh,
-                    ReplaceAllMetadata = true
-                },
-                RefreshPriority.High);
-
-            return new ScanPathResult
+            // Plain Video/Folder items are mis-typed. Video should be Movie/Episode,
+            // Folder should be Series/etc. ResolvePaths with explicit collectionType
+            // will create the correct type. Only delete non-library-root Folders
+            // (library roots have a non-Folder parent like AggregateFolder).
+            bool isMisTyped = existing.GetType() == typeof(Video);
+            if (!isMisTyped && existing.GetType() == typeof(Folder))
             {
-                Status = ScanStatus.Refreshed,
-                ItemId = existing.Id.ToString("N"),
-                ItemName = existing.Name
-            };
+                var folderParent = existing.GetParent();
+                if (folderParent == null || folderParent.GetType() == typeof(Folder))
+                {
+                    isMisTyped = true;
+                }
+            }
+
+            if (isMisTyped)
+            {
+                _logger.LogInformation(
+                    "TargetedScan: removing mis-typed {Type} item {Name} ({Id}) so it can be re-created with correct type",
+                    existing.GetType().Name, existing.Name, existing.Id);
+                var parent = existing.GetParent();
+                _libraryManager.DeleteItem(existing, new DeleteOptions
+                {
+                    DeleteFileLocation = false,
+                    DeleteFromExternalProvider = false
+                }, parent, false);
+                cache?.Remove(path);
+                // Fall through to walk-up + creation below
+            }
+            else
+            {
+                _logger.LogInformation("TargetedScan: item already exists ({Id}), queuing refresh", existing.Id);
+                _providerManager.QueueRefresh(
+                    existing.Id,
+                    new MetadataRefreshOptions(new DirectoryService(_fileSystem))
+                    {
+                        MetadataRefreshMode = MetadataRefreshMode.FullRefresh,
+                        ReplaceAllMetadata = true
+                    },
+                    RefreshPriority.Normal);
+
+                return new ScanPathResult
+                {
+                    Status = ScanStatus.Refreshed,
+                    ItemId = existing.Id.ToString("N"),
+                    ItemName = existing.Name
+                };
+            }
         }
 
         // 3. Walk up BEFORE acquiring lock (read-only, safe without lock)
@@ -200,7 +283,7 @@ public class TargetedScanService
                     MetadataRefreshMode = MetadataRefreshMode.FullRefresh,
                     ReplaceAllMetadata = true
                 },
-                RefreshPriority.High);
+                RefreshPriority.Normal);
 
             return Task.FromResult(new ScanPathResult
             {
@@ -218,6 +301,9 @@ public class TargetedScanService
         missingPaths.Reverse();
 
         var directoryService = new DirectoryService(_fileSystem);
+        var collectionType = _libraryManager.GetContentType(knownAncestor);
+        var libraryOptions = _libraryManager.GetLibraryOptions(knownAncestor);
+        _logger.LogInformation("TargetedScan: collection type = {CollectionType}", collectionType?.ToString() ?? "null");
         Folder currentParent = knownAncestor;
         BaseItem? lastCreated = null;
         foreach (var missingPath in missingPaths)
@@ -226,25 +312,51 @@ public class TargetedScanService
             var alreadyExists = _libraryManager.FindByPath(missingPath, null);
             if (alreadyExists != null)
             {
-                cache?.Remove(missingPath);
-                cache?.TryAdd(missingPath, alreadyExists);
-
-                _logger.LogInformation("TargetedScan: {Path} already exists (concurrent create), skipping", missingPath);
-                if (alreadyExists is Folder existingFolder)
+                // If this is a plain Folder (not Series/Season/CollectionFolder/etc.),
+                // it was likely created by a library scan as a generic container.
+                // Delete it so ResolvePath can re-create it with the correct type
+                // (e.g. Movie in a movie library, Series in a TV library).
+                if (alreadyExists.GetType() == typeof(Folder))
                 {
-                    currentParent = existingFolder;
-                    lastCreated = alreadyExists;
-                    continue;
+                    _logger.LogInformation(
+                        "TargetedScan: removing plain Folder {Name} ({Id}) so it can be re-created with correct type",
+                        alreadyExists.Name, alreadyExists.Id);
+                    var folderParent = alreadyExists.GetParent();
+                    _libraryManager.DeleteItem(alreadyExists, new DeleteOptions
+                    {
+                        DeleteFileLocation = false,
+                        DeleteFromExternalProvider = false
+                    }, folderParent, false);
+                    cache?.Remove(missingPath);
+                    // Fall through to ResolvePaths below to create with correct type
                 }
                 else
                 {
-                    lastCreated = alreadyExists;
-                    break;
+                    cache?.Remove(missingPath);
+                    cache?.TryAdd(missingPath, alreadyExists);
+
+                    _logger.LogInformation("TargetedScan: {Path} already exists (concurrent create), skipping", missingPath);
+                    if (alreadyExists is Folder existingFolder)
+                    {
+                        currentParent = existingFolder;
+                        lastCreated = alreadyExists;
+                        continue;
+                    }
+                    else
+                    {
+                        lastCreated = alreadyExists;
+                        break;
+                    }
                 }
             }
 
             var fileInfo = _fileSystem.GetFileSystemInfo(missingPath);
-            var newItem = _libraryManager.ResolvePath(fileInfo, currentParent, directoryService);
+            var newItem = _libraryManager.ResolvePaths(
+                new[] { fileInfo },
+                directoryService,
+                currentParent,
+                libraryOptions,
+                collectionType).FirstOrDefault();
 
             if (newItem == null)
             {
@@ -312,10 +424,10 @@ public class TargetedScanService
                 ancestor.Id,
                 new MetadataRefreshOptions(directoryService)
                 {
-                    MetadataRefreshMode = MetadataRefreshMode.FullRefresh,
+                    MetadataRefreshMode = MetadataRefreshMode.Default,
                     ReplaceAllMetadata = false
                 },
-                RefreshPriority.High);
+                RefreshPriority.Normal);
             _logger.LogInformation("TargetedScan: queued ancestor refresh for {Name} ({Type})",
                 ancestor.Name, ancestor.GetType().Name);
         }
@@ -376,5 +488,8 @@ public enum ScanStatus
     Failed,
 
     /// <summary>Sibling will be auto-discovered by parent metadata refresh.</summary>
-    Discovered
+    Discovered,
+
+    /// <summary>Stale item removed (file no longer exists on filesystem).</summary>
+    Removed
 }

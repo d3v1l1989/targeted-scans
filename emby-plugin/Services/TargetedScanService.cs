@@ -79,6 +79,32 @@ namespace EmbyTargetedScan.Services
             // 1. Verify path exists on filesystem
             if (!Directory.Exists(path) && !File.Exists(path))
             {
+                // Check if there's a stale database entry to clean up (upgrade scenario:
+                // Sonarr/Radarr deleted the old file and sent us the deleted path)
+                var staleItem = _libraryManager.FindByPath(path, null);
+                if (staleItem != null)
+                {
+                    _logger.Info(
+                        "TargetedScan: removing stale item {0} ({1}) — file no longer exists: {2}",
+                        staleItem.Name, staleItem.InternalId, path);
+                    var parent = staleItem.GetParent();
+                    _libraryManager.DeleteItem(staleItem, new DeleteOptions
+                    {
+                        DeleteFileLocation = false,
+                        DeleteFromExternalProvider = false
+                    }, parent, false);
+                    if (cache != null)
+                    {
+                        cache.Remove(path);
+                    }
+                    return new ScanPathResult
+                    {
+                        Status = ScanStatus.Removed,
+                        ItemId = staleItem.InternalId.ToString(),
+                        ItemName = staleItem.Name
+                    };
+                }
+
                 _logger.Warn("TargetedScan: path does not exist on filesystem: {0}", path);
                 return new ScanPathResult { Status = ScanStatus.PathNotFound };
             }
@@ -342,6 +368,7 @@ namespace EmbyTargetedScan.Services
         PathNotFound,
         ParentNotFound,
         Failed,
-        Discovered
+        Discovered,
+        Removed
     }
 }

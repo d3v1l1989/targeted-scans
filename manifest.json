@@ -9,6 +9,14 @@
     "imageUrl": "https://raw.githubusercontent.com/d3v1l1989/targeted-scans/main/jellyfin-plugin/thumb.png",
     "versions": [
       {
+        "version": "1.9.0.0",
+        "changelog": "Fix mis-typed Video/Folder items: use ResolvePaths with explicit collectionType so SeriesResolver and MovieResolver work correctly, auto-detect and re-create items stored as plain Video or Folder",
+        "targetAbi": "10.11.0.0",
+        "sourceUrl": "https://github.com/d3v1l1989/targeted-scans/releases/download/v1.9.0/jellyfin-targeted-scan-v1.9.0.zip",
+        "checksum": "f7a36c2ad72814f33ee496a65cf7f757",
+        "timestamp": "2026-02-23T00:00:00Z"
+      },
+      {
         "version": "1.8.0.0",
         "changelog": "Auto-remove stale items on file upgrades, use Default refresh mode for ancestors to prevent cascading ValidateChildren storms, lower refresh priority to Normal to avoid starving active streams",
         "targetAbi": "10.11.0.0",
